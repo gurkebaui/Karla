@@ -319,7 +319,28 @@ class ReasoningDataset(Dataset):
                 return_tensors="pt",
             )[0]
             
-            attention_mask = torch.ones_like(input_ids)
+            # === WICHTIG: Padding auf max_length für Batch-Kompatibilität ===
+            seq_len = len(input_ids)
+            
+            if seq_len > self.max_length:
+                # Truncate
+                input_ids = input_ids[:self.max_length]
+                attention_mask = torch.ones(self.max_length, dtype=torch.long)
+            else:
+                # Pad to max_length
+                padding_length = self.max_length - seq_len
+                
+                # Padding token (meist 0 oder tokenizer.pad_token_id)
+                pad_token_id = getattr(self.tokenizer, 'pad_token_id', 0) or 0
+                
+                # Create padded tensors
+                padding_ids = torch.full((padding_length,), pad_token_id, dtype=torch.long)
+                input_ids = torch.cat([input_ids, padding_ids])
+                
+                attention_mask = torch.cat([
+                    torch.ones(seq_len, dtype=torch.long),
+                    torch.zeros(padding_length, dtype=torch.long)
+                ])
             
         except (AttributeError, TypeError):
             # Fallback: Manuelle Formatierung

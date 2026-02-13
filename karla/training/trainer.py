@@ -269,9 +269,9 @@ class KarlaTrainer:
         self.model.train()
         total_loss = 0.0
         num_batches = 0
-        
+
         self.optimizer.zero_grad()
-        
+
         for batch_idx, batch in enumerate(self.train_dataloader):
             # Move to device
             input_ids = batch['input_ids'].to(self.device)
@@ -280,7 +280,7 @@ class KarlaTrainer:
                 attention_mask = attention_mask.to(self.device)
             labels = batch.get('labels', input_ids.clone())
             labels = labels.to(self.device)
-            
+
             # Forward pass
             device_type = 'cuda' if self.device.type == 'cuda' else 'cpu'
             with autocast(device_type=device_type, enabled=self.use_amp):
@@ -290,50 +290,75 @@ class KarlaTrainer:
                     labels=labels,
                 )
                 loss = outputs.loss / self.gradient_accumulation_steps
-            
+
+            # FIX: Check for NaN loss before backward pass
+            if torch.isnan(loss).any():
+                logger.warning(
+                    f"[Step {self.state.global_step}] NaN loss detected! "
+                    f"Skipping backward pass and resetting gradients."
+                )
+                self.optimizer.zero_grad()
+                continue
+
             # Backward pass
             if self.use_amp:
                 self.scaler.scale(loss).backward()
             else:
                 loss.backward()
-            
+
             total_loss += loss.item() * self.gradient_accumulation_steps
             num_batches += 1
-            
+
             # Gradient accumulation
             if (batch_idx + 1) % self.gradient_accumulation_steps == 0:
+                # FIX: Check for NaN gradients before clipping
+                has_nan_grad = False
+                for p in self.model.parameters():
+                    if p.requires_grad and p.grad is not None:
+                        if torch.isnan(p.grad).any():
+                            has_nan_grad = True
+                            break
+
+                if has_nan_grad:
+                    logger.warning(
+                        f"[Step {self.state.global_step}] NaN gradients detected! "
+                        f"Skipping optimizer step and resetting gradients."
+                    )
+                    self.optimizer.zero_grad()
+                    continue
+
                 # Gradient clipping
                 if self.use_amp:
                     self.scaler.unscale_(self.optimizer)
-                
+
                 torch.nn.utils.clip_grad_norm_(
                     [p for p in self.model.parameters() if p.requires_grad],
                     self.max_grad_norm
                 )
-                
+
                 # Optimizer step
                 if self.use_amp:
                     self.scaler.step(self.optimizer)
                     self.scaler.update()
                 else:
                     self.optimizer.step()
-                
+
                 self.optimizer.zero_grad()
                 self.scheduler.step()
-                
+
                 # Update L1 memory (delta rule)
                 if self.state.global_step % self.l1_update_frequency == 0:
                     self.model.update_memory()
-                
+
                 self.state.global_step += 1
-                
+
                 # Logging
                 if self.state.global_step % self.log_interval == 0:
                     avg_loss = total_loss / num_batches
                     lr = self.scheduler.get_last_lr()[0]
                     self.state.train_losses.append(avg_loss)
                     self.state.learning_rates.append(lr)
-                    
+
                     logger.info(
                         f"[Step {self.state.global_step}] "
                         f"Loss: {avg_loss:.4f} | "

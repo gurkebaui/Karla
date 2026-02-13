@@ -1,198 +1,41 @@
 #!/usr/bin/env python3
 """
-Karla Training Script
-=====================
-Main entry point for training Karla models.
-
+C1 Architecture Training Script
+================================
 Usage:
-    # Quick test (mock model, lite components)
-    python train_karla.py --mode test
-    
-    # Full training
     python train_karla.py --mode train
-    
-    # Custom configuration
-    python train_karla.py --mode train --l2-lr 1e-4 --epochs 50
-    
-    # Evaluation only
-    python train_karla.py --mode eval --checkpoint checkpoints/best_model.pt
-
-The Self-Evolving Reasoner (Frankenstein 2.0)
-Target: DeepSeek-Level Reasoning on RTX 4060 Ti
-
-Architecture:
-┌─────────────────────────────────────────┐
-│  L0: Qwen 2.5-1.5B 4-bit (Frozen)      │  ~2GB VRAM
-│  L1: CMS Engram Memory (CPU)           │  Scalable RAM
-│  L2: CTM + BitNet Reasoning (Trainable)│  ~50MB VRAM
-└─────────────────────────────────────────┘
+    python train_karla.py --mode train --epochs 5 --batch-size 2
 """
 
 import argparse
 import os
 import sys
 import torch
+import torch.nn as nn
 import logging
-from datetime import datetime
+import time
 
-# Add parent directory to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from karla.utils.config import KarlaConfig
-from karla.models.karla import create_karla, Karla
-from karla.models.l0_perception import L0Perception, L0PerceptionMock
-from karla.training.trainer import KarlaTrainer
+from karla.models.karla import create_karla
 from karla.data.dataset import ReasoningDataset, create_dataloader
 
-# Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s │ %(levelname)-8s │ %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
-logger = logging.getLogger("Karla")
-
-
-def print_banner():
-    """Print startup banner"""
-    banner = """
-╔═══════════════════════════════════════════════════════════════╗
-║                                                               ║
-║   ██╗  ██╗ █████╗ ██████╗ ██╗     ███████╗██████╗           ║
-║   ██║ ██╔╝██╔══██╗██╔══██╗██║     ██╔════╝██╔══██╗          ║
-║   █████╔╝ ███████║██████╔╝██║     █████╗  ██████╔╝          ║
-║   ██╔═██╗ ██╔══██║██╔══██╗██║     ██╔══╝  ██╔══██╗          ║
-║   ██║  ██╗██║  ██║██║  ██║███████╗███████╗██║  ██║          ║
-║   ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚══════╝╚══════╝╚═╝  ╚═╝          ║
-║                                                               ║
-║         The Self-Evolving Reasoner (Frankenstein 2.0)        ║
-║                                                               ║
-║   L0: Perception (Frozen)  │  L1: Memory (CPU)  │  L2: CTM   ║
-║                                                               ║
-╚═══════════════════════════════════════════════════════════════╝
-"""
-    print(banner)
-
-
-def create_test_config() -> KarlaConfig:
-    """Create configuration for quick testing"""
-    config = KarlaConfig()
-    
-    # L0: Use mock for testing
-    config.l0.hidden_size = 256
-    
-    # L1: Lightweight memory
-    config.l1.embedding_dim = 128
-    config.l1.num_heads = 4
-    
-    # L2: Small CTM
-    config.l2.hidden_dim = 128
-    config.l2.num_neurons = 64
-    config.l2.num_internal_ticks = 5
-    
-    # Training: Quick iterations
-    config.training.num_epochs = 3
-    config.training.batch_size = 2
-    config.training.gradient_accumulation_steps = 2
-    config.training.log_interval = 1
-    config.training.eval_interval = 5
-    
-    return config
-
-
-def create_production_config() -> KarlaConfig:
-    """Create configuration for production training"""
-    config = KarlaConfig()
-    
-    # L0: Full Qwen 2.5-1.5B
-    config.l0.model_name = "Qwen/Qwen2.5-1.5B"
-    config.l0.bits = 4
-    config.l0.frozen = True
-    
-    # L1: Larger memory
-    config.l1.embedding_dim = 512
-    config.l1.num_heads = 8
-    config.l1.memory_size = 500_000
-    
-    # L2: Full CTM
-    config.l2.hidden_dim = 512
-    config.l2.num_neurons = 256
-    config.l2.num_internal_ticks = 10
-    config.l2.use_bitnet = True
-    
-    # Training
-    config.training.num_epochs = 100
-    config.training.batch_size = 4
-    config.training.gradient_accumulation_steps = 4
-    config.training.l2_lr = 3e-4
-    config.training.weight_decay = 0.01  # Important for grokking!
-    
-    return config
-
-
-def run_test_mode():
-    """Run quick test with mock components"""
-    logger.info("=" * 60)
-    logger.info("RUNNING TEST MODE")
-    logger.info("=" * 60)
-    
-    config = create_test_config()
-    
-    # Create model with mock components
-    logger.info("Creating model (mock mode)...")
-    model = create_karla(config, use_mock=True, use_lite=True)
-    
-    # Print model info
-    param_counts = model.count_parameters()
-    logger.info(f"Model parameters: {param_counts}")
-    
-    # Create dataset WITHOUT tokenizer (mock mode)
-    logger.info("Creating dataset...")
-    dataset = ReasoningDataset(
-        data_path="data/micro_pope_data.jsonl",  # Will create synthetic if missing
-        tokenizer=None,  # No tokenizer in mock mode
-        max_length=128,
-    )
-    
-    dataloader = create_dataloader(dataset, batch_size=config.training.batch_size)
-    
-    # Create trainer
-    trainer = KarlaTrainer(
-        model=model,
-        train_dataloader=dataloader,
-        l2_lr=config.training.l2_lr,
-        num_epochs=config.training.num_epochs,
-        gradient_accumulation_steps=config.training.gradient_accumulation_steps,
-        log_interval=config.training.log_interval,
-        output_dir="checkpoints_test",
-        run_name="karla_test",
-    )
-    
-    # Train
-    logger.info("Starting training...")
-    trainer.train()
-    
-    logger.info("Test completed successfully!")
-    return trainer
+logger = logging.getLogger("C1")
 
 
 def run_train_mode(args):
-    """Run full training"""
     logger.info("=" * 60)
-    logger.info("RUNNING TRAIN MODE")
+    logger.info("C1 ARCHITECTURE - TRAINING")
     logger.info("=" * 60)
-    
-    # Create config
-    if args.quick:
-        config = create_test_config()
-        use_mock = True
-        use_lite = True
-    else:
-        config = create_production_config()
-        use_mock = False
-        use_lite = False
-    
-    # Override with command line args
+
+    config = KarlaConfig()
+
+    # CLI overrides
     if args.epochs:
         config.training.num_epochs = args.epochs
     if args.batch_size:
@@ -201,223 +44,234 @@ def run_train_mode(args):
         config.training.l2_lr = args.l2_lr
     if args.data_path:
         config.training.data_path = args.data_path
-    
-    # Check GPU
+
+    device = torch.device(config.training.device)
+
+    # GPU info
     if torch.cuda.is_available():
-        gpu_name = torch.cuda.get_device_name(0)
-        gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1e9
-        logger.info(f"GPU: {gpu_name} ({gpu_memory:.1f} GB)")
-    else:
-        logger.warning("No GPU detected! Training on CPU will be slow.")
-    
-    # === WICHTIG: Tokenizer laden BEVOR Dataset erstellt wird ===
-    tokenizer = None
-    
-    if not use_mock:
-        logger.info("Loading tokenizer from Qwen...")
-        try:
-            from transformers import AutoTokenizer
-            
-            tokenizer = AutoTokenizer.from_pretrained(
-                config.l0.model_name,
-                trust_remote_code=True,
-            )
-            
-            # Ensure pad token
-            if tokenizer.pad_token is None:
-                tokenizer.pad_token = tokenizer.eos_token
-            
-            logger.info(f"Tokenizer loaded. Vocab size: {len(tokenizer)}")
-            
-        except Exception as e:
-            logger.warning(f"Failed to load tokenizer: {e}")
-            logger.info("Will proceed without tokenizer (will cause issues!)")
-    
-    # Create model
+        gpu = torch.cuda.get_device_name(0)
+        mem = torch.cuda.get_device_properties(0).total_memory / 1e9
+        logger.info(f"GPU: {gpu} ({mem:.1f} GB)")
+
+    # === 1. Tokenizer ===
+    logger.info("Loading tokenizer...")
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained(
+        config.l0.model_name, trust_remote_code=True
+    )
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    logger.info(f"Vocab size: {len(tokenizer)}")
+
+    # === 2. Model ===
     logger.info("Creating model...")
-    model = create_karla(config, use_mock=use_mock, use_lite=use_lite)
-    
-    # If tokenizer wasn't loaded separately, try to get it from model
-    if tokenizer is None and hasattr(model.l0, 'tokenizer'):
-        # Trigger model loading to get tokenizer
-        _ = model.l0.tokenize("test")
-        tokenizer = model.l0.tokenizer
-        logger.info(f"Got tokenizer from model. Vocab size: {len(tokenizer)}")
-    
-    # Print model info
-    param_counts = model.count_parameters()
-    memory_estimate = model.estimate_memory()
-    
-    logger.info(f"Model parameters:")
-    for k, v in param_counts.items():
+    model = create_karla(config)
+
+    counts = model.count_parameters()
+    for k, v in counts.items():
         logger.info(f"  {k}: {v:,}")
-    
-    logger.info(f"Memory estimate:")
-    for k, v in memory_estimate.items():
-        logger.info(f"  {k}: {v:.2f} GB")
-    
-    # === Dataset mit Tokenizer erstellen ===
-    logger.info(f"Loading dataset from: {config.training.data_path}")
+
+    model.l1.to(device)
+    model.l2.to(device)
+    model.l0_proj.to(device)
+    model.l1_proj.to(device)
+
+    # === 3. Dataset ===
+    logger.info(f"Loading dataset: {config.training.data_path}")
     dataset = ReasoningDataset(
         data_path=config.training.data_path,
-        tokenizer=tokenizer,  # <-- TOKENIZER HIER ÜBERGEBEN!
+        tokenizer=tokenizer,
         max_length=config.training.max_seq_length,
-        pope_prefix_ratio=config.training.pope_prefix_ratio,
-        use_pope=config.training.use_pope,
     )
-    
     dataloader = create_dataloader(
-        dataset,
-        batch_size=config.training.batch_size,
+        dataset, batch_size=config.training.batch_size
     )
-    
-    # Create trainer
-    trainer = KarlaTrainer(
-        model=model,
-        train_dataloader=dataloader,
-        l2_lr=config.training.l2_lr,
-        l1_lr=config.training.l1_lr,
-        l1_update_frequency=config.training.l1_update_frequency,
-        num_epochs=config.training.num_epochs,
-        gradient_accumulation_steps=config.training.gradient_accumulation_steps,
-        weight_decay=config.l2.weight_decay,
-        use_amp=config.training.mixed_precision,
-        log_interval=config.training.log_interval,
-        eval_interval=config.training.eval_interval,
-        save_interval=config.training.save_interval,
-        output_dir=config.training.output_dir,
-        run_name=config.training.run_name,
+
+    # === 4. Optimizer ===
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    logger.info(f"Trainable parameters: {sum(p.numel() for p in trainable_params):,}")
+
+    optimizer = torch.optim.AdamW(
+        trainable_params,
+        lr=config.training.l2_lr,
+        weight_decay=config.training.weight_decay,
+        betas=(0.9, 0.95),
     )
-    
-    # Load checkpoint if specified
-    if args.checkpoint:
-        logger.info(f"Loading checkpoint: {args.checkpoint}")
-        trainer.load_checkpoint(args.checkpoint)
-    
-    # Train
-    logger.info("Starting training...")
-    logger.info(f"Configuration:")
-    logger.info(f"  Epochs: {config.training.num_epochs}")
-    logger.info(f"  Batch size: {config.training.batch_size}")
-    logger.info(f"  L2 LR: {config.training.l2_lr}")
-    logger.info(f"  L1 LR: {config.training.l1_lr}")
-    logger.info(f"  Weight decay: {config.l2.weight_decay}")
-    
-    start_time = datetime.now()
-    trainer.train()
-    elapsed = datetime.now() - start_time
-    
-    logger.info(f"Training completed in {elapsed}")
-    logger.info(f"Best validation loss: {trainer.state.best_val_loss:.4f}")
-    
-    if trainer.state.grokking_detected:
-        logger.info(f"⚡ GROKKING DETECTED at step {trainer.state.grokking_step}!")
-    
-    return trainer
 
+    total_steps = len(dataloader) * config.training.num_epochs
+    warmup_steps = min(100, total_steps // 10)
 
-def run_eval_mode(args):
-    """Run evaluation only"""
-    logger.info("=" * 60)
-    logger.info("RUNNING EVAL MODE")
-    logger.info("=" * 60)
-    
-    if not args.checkpoint:
-        logger.error("Checkpoint required for eval mode. Use --checkpoint path")
-        return None
-    
-    # Create model
-    config = create_production_config()
-    model = create_karla(config)
-    
-    # Load checkpoint
-    checkpoint = torch.load(args.checkpoint, map_location='cpu')
-    model.load_state_dict(checkpoint['model_state_dict'])
-    
-    logger.info(f"Loaded checkpoint: {args.checkpoint}")
-    logger.info(f"Training step: {checkpoint['training_state']['global_step']}")
-    
-    # TODO: Add evaluation logic
-    
-    logger.info("Evaluation complete")
-    return model
+    def lr_lambda(step):
+        if step < warmup_steps:
+            return max(step / max(warmup_steps, 1), 1e-2)  # min 1% LR during warmup
+        progress = (step - warmup_steps) / max(total_steps - warmup_steps, 1)
+        return 0.1 + 0.9 * 0.5 * (1 + torch.cos(torch.tensor(progress * 3.14159)).item())
 
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+    # AMP scaler
+    use_amp = config.training.mixed_precision and torch.cuda.is_available()
+    scaler = torch.amp.GradScaler('cuda') if use_amp else None
+
+    # === 5. Training Loop ===
+    accum_steps = config.training.gradient_accumulation_steps
+    logger.info(f"Epochs: {config.training.num_epochs}")
+    logger.info(f"Batch size: {config.training.batch_size}")
+    logger.info(f"Gradient accumulation: {accum_steps}")
+    logger.info(f"Effective batch: {config.training.batch_size * accum_steps}")
+    logger.info(f"AMP: {use_amp}")
+
+    os.makedirs(config.training.output_dir, exist_ok=True)
+    global_step = 0
+    best_loss = float('inf')
+    nan_count = 0
+
+    model.train()
+
+    for epoch in range(config.training.num_epochs):
+        epoch_loss = 0.0
+        epoch_steps = 0
+        epoch_start = time.time()
+
+        optimizer.zero_grad()
+
+        for batch_idx, batch in enumerate(dataloader):
+            input_ids = batch['input_ids'].to(device)
+            attention_mask = batch.get('attention_mask')
+            if attention_mask is not None:
+                attention_mask = attention_mask.to(device)
+            labels = batch.get('labels', input_ids.clone()).to(device)
+
+            # Forward
+            try:
+                if use_amp:
+                    with torch.amp.autocast('cuda'):
+                        outputs = model(input_ids, attention_mask, labels)
+                        loss = outputs.loss / accum_steps
+                else:
+                    outputs = model(input_ids, attention_mask, labels)
+                    loss = outputs.loss / accum_steps
+            except RuntimeError as e:
+                if "out of memory" in str(e):
+                    logger.warning(f"OOM at step {global_step}! Clearing cache.")
+                    torch.cuda.empty_cache()
+                    optimizer.zero_grad()
+                    continue
+                raise
+
+            # NaN check — skip backward but do NOT zero_grad
+            # (keep valid accumulated gradients from other sub-steps)
+            if not torch.isfinite(loss):
+                nan_count += 1
+                if nan_count <= 10:
+                    logger.warning(
+                        f"Step {global_step}, sub-step {batch_idx % accum_steps}: "
+                        f"NaN/Inf loss! (total: {nan_count})"
+                    )
+                if nan_count > 200:
+                    logger.error("Too many NaN losses. Stopping.")
+                    return
+                # Fall through to accumulation check below (don't backward)
+            else:
+                # Backward — only if loss is finite
+                if use_amp:
+                    scaler.scale(loss).backward()
+                else:
+                    loss.backward()
+
+                epoch_loss += loss.item() * accum_steps
+                epoch_steps += 1
+
+            # === Optimizer step at accumulation boundary ===
+            if (batch_idx + 1) % accum_steps == 0:
+                if use_amp:
+                    # 1. Unscale gradients
+                    scaler.unscale_(optimizer)
+
+                    # 2. Clip gradients
+                    nn.utils.clip_grad_norm_(
+                        trainable_params, config.training.max_grad_norm
+                    )
+
+                    # 3. Step (internally skips if grads are inf/nan)
+                    scaler.step(optimizer)
+
+                    # 4. ALWAYS update scaler — this is critical!
+                    scaler.update()
+                else:
+                    grad_norm = nn.utils.clip_grad_norm_(
+                        trainable_params, config.training.max_grad_norm
+                    )
+                    if torch.isfinite(grad_norm):
+                        optimizer.step()
+                    else:
+                        logger.warning(f"Step {global_step}: Non-finite grad norm!")
+
+                optimizer.zero_grad()
+                scheduler.step()
+                global_step += 1
+
+                # L1 memory updates
+                if global_step % config.training.l1_update_frequency == 0:
+                    model.update_memory()
+
+                # Logging
+                if global_step % config.training.log_interval == 0:
+                    avg_loss = epoch_loss / max(epoch_steps, 1)
+                    lr = optimizer.param_groups[0]['lr']
+                    logger.info(
+                        f"Epoch {epoch} | Step {global_step} | "
+                        f"Loss: {avg_loss:.4f} | LR: {lr:.2e} | "
+                        f"Ticks: {outputs.internal_ticks} | "
+                        f"NaN: {nan_count}"
+                    )
+
+        # Epoch summary
+        avg_epoch_loss = epoch_loss / max(epoch_steps, 1)
+        elapsed = time.time() - epoch_start
+        logger.info(
+            f"Epoch {epoch} complete | "
+            f"Loss: {avg_epoch_loss:.4f} | "
+            f"Time: {elapsed:.1f}s | "
+            f"Steps: {epoch_steps}"
+        )
+
+        # Save checkpoint
+        if avg_epoch_loss < best_loss and epoch_steps > 0:
+            best_loss = avg_epoch_loss
+            path = os.path.join(config.training.output_dir, "best_model.pt")
+            torch.save({
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'epoch': epoch,
+                'loss': avg_epoch_loss,
+                'global_step': global_step,
+            }, path)
+            logger.info(f"Saved best model: {path}")
+
+        path = os.path.join(config.training.output_dir, f"epoch_{epoch}.pt")
+        torch.save(model.state_dict(), path)
+
+    logger.info("Training complete!")
+    logger.info(f"Best loss: {best_loss:.4f}")
+    logger.info(f"Total NaN losses: {nan_count}")
 
 def main():
-    """Main entry point"""
-    parser = argparse.ArgumentParser(
-        description="Karla - The Self-Evolving Reasoner",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    
-    parser.add_argument(
-        "--mode",
-        type=str,
-        default="test",
-        choices=["test", "train", "eval"],
-        help="Running mode (default: test)"
-    )
-    
-    parser.add_argument(
-        "--quick",
-        action="store_true",
-        help="Use lightweight model for quick testing"
-    )
-    
-    parser.add_argument(
-        "--epochs",
-        type=int,
-        default=None,
-        help="Number of training epochs"
-    )
-    
-    parser.add_argument(
-        "--batch-size",
-        type=int,
-        default=None,
-        help="Batch size"
-    )
-    
-    parser.add_argument(
-        "--l2-lr",
-        type=float,
-        default=None,
-        help="Learning rate for L2 (CTM)"
-    )
-    
-    parser.add_argument(
-        "--data-path",
-        type=str,
-        default=None,
-        help="Path to training data (JSONL)"
-    )
-    
-    parser.add_argument(
-        "--checkpoint",
-        type=str,
-        default=None,
-        help="Path to checkpoint to load"
-    )
-    
-    parser.add_argument(
-        "--output-dir",
-        type=str,
-        default="checkpoints",
-        help="Output directory for checkpoints"
-    )
-    
+    parser = argparse.ArgumentParser(description="C1 Architecture Training")
+    parser.add_argument("--mode", default="train", choices=["train", "test", "eval"])
+    parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--l2-lr", type=float, default=None)
+    parser.add_argument("--data-path", type=str, default=None)
+    parser.add_argument("--checkpoint", type=str, default=None)
+    parser.add_argument("--quick", action="store_true")
+
     args = parser.parse_args()
-    
-    # Print banner
-    print_banner()
-    
-    # Run appropriate mode
-    if args.mode == "test":
-        return run_test_mode()
-    elif args.mode == "train":
-        return run_train_mode(args)
-    elif args.mode == "eval":
-        return run_eval_mode(args)
+
+    if args.mode == "train":
+        run_train_mode(args)
+    else:
+        logger.info(f"Mode '{args.mode}' not yet implemented")
 
 
 if __name__ == "__main__":
