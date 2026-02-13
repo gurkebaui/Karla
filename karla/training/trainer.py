@@ -221,6 +221,9 @@ class KarlaTrainer:
         # Device
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         
+        # Move model to device (wichtig für CUDA!)
+        self.model = self.model.to(self.device)
+        
         logger.info(f"[Trainer] Initialized on {self.device}")
         logger.info(f"[Trainer] Trainable parameters: {sum(p.numel() for p in trainable_params):,}")
     
@@ -279,7 +282,8 @@ class KarlaTrainer:
             labels = labels.to(self.device)
             
             # Forward pass
-            with autocast(device_type='cuda', enabled=self.use_amp):
+            device_type = 'cuda' if self.device.type == 'cuda' else 'cpu'
+            with autocast(device_type=device_type, enabled=self.use_amp):
                 outputs = self.model(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
