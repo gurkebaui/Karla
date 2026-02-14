@@ -41,7 +41,7 @@ class TrainingConfig:
     gradient_accumulation_steps: int = 16
     l2_lr: float = 1e-4
     l1_lr: float = 0.001
-    l1_update_frequency: int = 100
+    l1_update_frequency: int = 1
     max_grad_norm: float = 1.0
     weight_decay: float = 0.01
     mixed_precision: bool = True

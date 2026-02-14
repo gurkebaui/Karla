@@ -1,8 +1,9 @@
 """
 L1 Memory System - CMS Engram
 ==============================
-Hash-based O(1) lookup memory.
+Hash-based O(1) lookup memory with gradient-driven delta-rule learning.
 Embedding tables on CPU, gating on GPU.
+Gradients flow via register_hook → queued → applied asynchronously.
 """
 
 import torch
@@ -52,15 +53,7 @@ class MultiHeadHasher:
                 result[(n_idx, h_idx)] = self.hash_ngram(ngram, h_idx, n_idx)
         return result
 
-
 class EngramMemory(nn.Module):
-    """
-    Hash-based memory with gated retrieval.
-    
-    CRITICAL: All retrieved embeddings are normalized before gating
-    to prevent NaN from extreme concatenated values.
-    """
-
     def __init__(
         self,
         embedding_dim: int = 512,
@@ -96,30 +89,39 @@ class EngramMemory(nn.Module):
         self.gate_query = nn.Linear(hidden_dim, embedding_dim)
         self.gate_key = nn.Linear(self.concat_dim, embedding_dim)
         self.gate_value = nn.Linear(self.concat_dim, embedding_dim)
-        
-        # Normalization BEFORE gating projections
+
+        # Normalization
         self.raw_norm = nn.LayerNorm(self.concat_dim)
         self.query_norm = nn.LayerNorm(hidden_dim)
-        
+
         self.output_proj = nn.Linear(embedding_dim, embedding_dim)
         self.output_norm = nn.LayerNorm(embedding_dim)
 
-        # Delta rule
-        self.update_queue = []
+        # === FIXED: Dict-based gradient accumulator (bounded memory) ===
+        # Key: (table_name, row_index) → Value: accumulated gradient
+        # Max possible entries: num_tables × table_size = 8 × 50000 = 400K
+        # At 2KB each = 800MB worst case (in practice << 100MB)
+        self._grad_accumulator = {}
         self._lock = threading.Lock()
         self._total_updates = 0
+        self._queued_count = 0
 
         logger.info(f"[L1] Engram Memory initialized")
         logger.info(f"[L1] Embedding tables on CPU, gating layers follow model device")
         logger.info(f"[L1] Embedding dim: {embedding_dim}, Heads: {num_heads}")
         logger.info(f"[L1] N-gram orders: {ngram_orders}")
-        logger.info(f"[L1] Total parameters: {sum(p.numel() for p in self.parameters()):,}")
+        logger.info(
+            f"[L1] Total parameters: {sum(p.numel() for p in self.parameters()):,}"
+        )
 
     def _retrieve_embeddings(self, token_ids, compute_device):
         batch_size, seq_len = token_ids.shape
         output = torch.zeros(
-            batch_size, seq_len, self.concat_dim,
-            device=compute_device, dtype=torch.float32,
+            batch_size,
+            seq_len,
+            self.concat_dim,
+            device=compute_device,
+            dtype=torch.float32,
         )
 
         for b in range(batch_size):
@@ -137,28 +139,77 @@ class EngramMemory(nn.Module):
                             parts.append(vec)
                         else:
                             parts.append(
-                                torch.zeros(self.embedding_dim, device=compute_device)
+                                torch.zeros(
+                                    self.embedding_dim, device=compute_device
+                                )
                             )
                 output[b, pos] = torch.cat(parts, dim=0)
 
         return output
 
+    def _queue_gradient_updates(self, token_ids, grad):
+        """
+        Aggregate gradients into dict keyed by (table_name, row_index).
+        
+        Same key = gradients are SUMMED (not appended).
+        Memory is bounded by number of unique table entries accessed.
+        """
+        batch_size, seq_len = token_ids.shape
+
+        with self._lock:
+            for b in range(batch_size):
+                for pos in range(seq_len):
+                    hashes = self.hasher.hash_position(token_ids[b], pos)
+                    if not hashes:
+                        continue
+
+                    offset = 0
+                    for n_idx in range(len(self.ngram_orders)):
+                        for h_idx in range(self.num_heads):
+                            key = (n_idx, h_idx)
+                            if key in hashes:
+                                name = f"emb_n{n_idx}_h{h_idx}"
+                                idx = hashes[key]
+                                g = grad[b, pos, offset : offset + self.embedding_dim]
+
+                                dict_key = (name, idx)
+                                if dict_key in self._grad_accumulator:
+                                    # Accumulate in-place (no new allocation!)
+                                    self._grad_accumulator[dict_key].add_(g)
+                                else:
+                                    self._grad_accumulator[dict_key] = g.clone()
+
+                                self._queued_count += 1
+                            offset += self.embedding_dim
+
     def forward(self, token_ids, hidden_states):
         compute_device = self.gate_query.weight.device
 
-        # 1. Retrieve raw embeddings
+        # 1. Retrieve raw embeddings from CPU tables
         raw_memory = self._retrieve_embeddings(token_ids, compute_device)
-        
-        # 2. Normalize BEFORE projecting (prevents NaN from 4096-dim concat)
-        raw_memory = self.raw_norm(raw_memory)
+
+        # 2. Enable gradient tracking
+        raw_memory = raw_memory.detach().requires_grad_(True)
+
+        # 3. Register hook for gradient capture
+        if self.training:
+            captured_ids = token_ids.detach().cpu()
+
+            def hook_fn(grad):
+                self._queue_gradient_updates(captured_ids, grad.detach().cpu())
+
+            raw_memory.register_hook(hook_fn)
+
+        # 4. Normalize (use separate variable to keep hook on raw_memory)
+        raw_normed = self.raw_norm(raw_memory)
         hidden_normed = self.query_norm(hidden_states)
 
-        # 3. Gated retrieval
+        # 5. Gated retrieval
         query = self.gate_query(hidden_normed)
-        key = self.gate_key(raw_memory)
-        value = self.gate_value(raw_memory)
+        key = self.gate_key(raw_normed)
+        value = self.gate_value(raw_normed)
 
-        scale = self.embedding_dim ** 0.5
+        scale = self.embedding_dim**0.5
         gate_scores = (query * key).sum(dim=-1, keepdim=True) / scale
         gate_weights = torch.sigmoid(gate_scores)
 
@@ -167,20 +218,35 @@ class EngramMemory(nn.Module):
 
         return L1Output(memory_vectors=output, retrieval_weights=gate_weights)
 
-    def apply_updates(self, max_updates=10000):
+    def apply_updates(self, max_updates=None):
+        """
+        Apply ALL accumulated gradient updates to CPU tables, then clear.
+        
+        Called every N steps from training loop.
+        Memory is freed immediately after application.
+        """
         with self._lock:
-            if not self.update_queue:
+            if not self._grad_accumulator:
                 return 0
+
             count = 0
-            for name, idx, grad in self.update_queue[:max_updates]:
+            for (name, idx), grad in self._grad_accumulator.items():
                 table = getattr(self, name)
                 with torch.no_grad():
-                    table[idx] += self.learning_rate * grad.to(table.device)
+                    table[idx] -= self.learning_rate * grad.to(table.device)
                 count += 1
                 self._total_updates += 1
-            self.update_queue = self.update_queue[max_updates:]
+
+            # FREE ALL MEMORY
+            self._grad_accumulator.clear()
+
             if count > 0:
-                logger.debug(f"[L1] Applied {count} updates")
+                logger.debug(
+                    f"[L1] Applied {count} unique entry updates "
+                    f"(from {self._queued_count:,} gradient samples, "
+                    f"total updates: {self._total_updates:,})"
+                )
+            self._queued_count = 0
             return count
 
 
