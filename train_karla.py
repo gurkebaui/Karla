@@ -71,10 +71,14 @@ def run_train_mode(args):
     for k, v in counts.items():
         logger.info(f"  {k}: {v:,}")
 
-    model.l1.to(device)
-    model.l2.to(device)
-    model.l0_proj.to(device)
-    model.l1_proj.to(device)
+        # Move everything to GPU, then let L0 reload on its own device_map
+    for name, module in model.named_children():
+        if name != 'l0':
+            module.to(device)
+    
+    # Move top-level parameters (l1_scale, ctm_scale)
+    model.l1_scale.data = model.l1_scale.data.to(device)
+    model.ctm_scale.data = model.ctm_scale.data.to(device)
 
     # === 3. Dataset ===
     logger.info(f"Loading dataset: {config.training.data_path}")

@@ -27,7 +27,7 @@ class L1Config:
 class L2Config:
     hidden_dim: int = 512
     num_neurons: int = 256
-    num_internal_ticks: int = 10
+    num_internal_ticks: int = 4
     use_bitnet: bool = True
     weight_decay: float = 0.01
 
@@ -37,7 +37,7 @@ class TrainingConfig:
     data_path: str = "data/micro_pope_data.jsonl"
     max_seq_length: int = 512
     num_epochs: int = 10
-    batch_size: int = 1
+    batch_size: int = 2
     gradient_accumulation_steps: int = 16
     l2_lr: float = 1e-4
     l1_lr: float = 0.001
