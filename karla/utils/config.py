@@ -1,7 +1,3 @@
-"""
-Configuration for Karla / C1 Architecture
-"""
-
 from dataclasses import dataclass, field
 from typing import List
 import torch
@@ -21,14 +17,25 @@ class L1Config:
     ngram_orders: List[int] = field(default_factory=lambda: [2, 3])
     table_size: int = 50000
     learning_rate: float = 0.001
+    conv_kernel_size: int = 4
+    conv_zero_init: bool = True
 
 
 @dataclass
 class L2Config:
     hidden_dim: int = 512
     num_neurons: int = 256
-    num_internal_ticks: int = 4
+    num_internal_ticks: int = 6
     use_bitnet: bool = True
+
+    # CTM paper-ish knobs (optional, defaults ok)
+    nlm_history_length: int = 25
+    nlm_hidden_dim: int = 32
+    num_action_pairs: int = 512
+    num_output_pairs: int = 512
+    attn_heads: int = 8
+    truncation_period: int = 4
+
     weight_decay: float = 0.01
 
 

@@ -1,0 +1,268 @@
+(base) henry@fedora:~/Documents/Karla/Karla$ pwd
+/home/henry/Documents/Karla/Karla
+(base) henry@fedora:~/Documents/Karla/Karla$ ls -la
+total 68
+drwxr-xr-x. 1 henry henry   194 Feb 15 07:04 .
+drwxr-xr-x. 1 henry henry   198 Feb 15 07:52 ..
+drwxr-xr-x. 1 henry henry    66 Feb 15 00:18 checkpoints
+drwxr-xr-x. 1 henry henry    58 Feb 15 05:27 checkpoints_rl
+drwxr-xr-x. 1 henry henry    42 Feb 13 18:00 data
+drwxr-xr-x. 1 henry henry   142 Feb 13 06:46 .git
+-rw-r--r--. 1 henry henry  4323 Feb 15 07:15 inference.py
+-rw-r--r--. 1 henry henry 12647 Feb 15 07:08 inference_rl.py
+drwxr-xr-x. 1 henry henry   154 Feb 13 06:45 karla
+-rw-r--r--. 1 henry henry  1066 Feb 13 06:45 LICENSE
+-rw-r--r--. 1 henry henry 10003 Feb 14 23:18 train_karla.py
+-rw-r--r--. 1 henry henry 26458 Feb 15 00:58 train_rl.py
+(base) henry@fedora:~/Documents/Karla/Karla$ find . -maxdepth 4 -type f \( -name "*.py" -o -name "*.yaml" -o -name "*.yml" \) | sort
+./inference.py
+./inference_rl.py
+./karla/data/dataset.py
+./karla/data/__init__.py
+./karla/__init__.py
+./karla/models/__init__.py
+./karla/models/karla.py
+./karla/models/l0_perception.py
+./karla/models/l1_engram.py
+./karla/models/l2_ctm.py
+./karla/scripts/__init__.py
+./karla/scripts/prepare_data.py
+./karla/training/__init__.py
+./karla/training/trainer.py
+./karla/utils/config.py
+./karla/utils/__init__.py
+./train_karla.py
+./train_rl.py
+(base) henry@fedora:~/Documents/Karla/Karla$ find ./karla -maxdepth 6 -type f -name "*.py" | sort
+./karla/data/dataset.py
+./karla/data/__init__.py
+./karla/__init__.py
+./karla/models/__init__.py
+./karla/models/karla.py
+./karla/models/l0_perception.py
+./karla/models/l1_engram.py
+./karla/models/l2_ctm.py
+./karla/scripts/__init__.py
+./karla/scripts/prepare_data.py
+./karla/training/__init__.py
+./karla/training/trainer.py
+./karla/utils/config.py
+./karla/utils/__init__.py
+(base) henry@fedora:~/Documents/Karla/Karla$ command -v tree >/dev/null && tree -a -L 4
+.
+├── checkpoints
+│   ├── best_model.pt
+│   ├── epoch_0.pt
+│   └── epoch_1.pt
+├── checkpoints_rl
+│   ├── best_rl_model.pt
+│   └── rl_step_50.pt
+├── data
+│   └── micro_pope_data.jsonl
+├── .git
+│   ├── config
+│   ├── description
+│   ├── FETCH_HEAD
+│   ├── HEAD
+│   ├── hooks
+│   │   ├── applypatch-msg.sample
+│   │   ├── commit-msg.sample
+│   │   ├── fsmonitor-watchman.sample
+│   │   ├── post-update.sample
+│   │   ├── pre-applypatch.sample
+│   │   ├── pre-commit.sample
+│   │   ├── pre-merge-commit.sample
+│   │   ├── prepare-commit-msg.sample
+│   │   ├── pre-push.sample
+│   │   ├── pre-rebase.sample
+│   │   ├── pre-receive.sample
+│   │   ├── push-to-checkout.sample
+│   │   ├── sendemail-validate.sample
+│   │   └── update.sample
+│   ├── index
+│   ├── info
+│   │   └── exclude
+│   ├── logs
+│   │   ├── HEAD
+│   │   └── refs
+│   │       ├── heads
+│   │       └── remotes
+│   ├── objects
+│   │   ├── 03
+│   │   │   └── c4ddb31190c431a9e4c748dcd91e4128a4d3c3
+│   │   ├── 05
+│   │   │   ├── 3a7e1d675ae34d4210c85e8622bdc4f1d71ac4
+│   │   │   ├── 3c60ebbd58b264e7769b7738311acafc410ed2
+│   │   │   └── fcace11917a14e48ecf2415f3a9baf6ce6bc27
+│   │   ├── 0b
+│   │   │   └── a7e6653cb801fa57c29f04bb185d89a373fc5a
+│   │   ├── 10
+│   │   │   └── 9b3bbff3c01ba30cad3e4985a5085925d04d17
+│   │   ├── 12
+│   │   │   └── 37b8a6cda4be1aedb6d80ce2f925c78bb97f64
+│   │   ├── 17
+│   │   │   └── 63993b6c033cdafcb08184e1e55e6be8e09b30
+│   │   ├── 19
+│   │   │   └── b5cece86ebab1997462e3688b473e5957f2323
+│   │   ├── 1b
+│   │   │   └── d5191604b58f29589c99c25c92c0a61cfde293
+│   │   ├── 1e
+│   │   │   └── d13d1e93290b003e9817f7f1f0f77141402704
+│   │   ├── 23
+│   │   │   └── 6b8c7c12eb28f45f4e49d66a05f12eda0f9116
+│   │   ├── 27
+│   │   │   └── 9dbd2a4b5b2259b98e46d21dc10dfc91209789
+│   │   ├── 2c
+│   │   │   └── 2b381b81d61a8cf5b8b04261787278ec31b4c4
+│   │   ├── 3d
+│   │   │   ├── 2b45622b6950200b27720951d02a23679e0b7c
+│   │   │   └── eea2a7f32ed0b2be16810f5ad5e847f2850250
+│   │   ├── 44
+│   │   │   └── e23b67dd805118c20007ad39cc9b25d237b555
+│   │   ├── 46
+│   │   │   └── f13392c58c5277ef303cf503da729597c08b43
+│   │   ├── 49
+│   │   │   └── 1a27e66a0c6aa4cc8cba79e1ebcf8d7917de4a
+│   │   ├── 53
+│   │   │   └── 46200af1be09ec8d377b67b19c5cba1f88a8dd
+│   │   ├── 5c
+│   │   │   └── d5df5f2aed0a89da9bf1952116c7894eb84bb7
+│   │   ├── 5e
+│   │   │   ├── 782f1e7c8b2f25ec315d9957fe055bc1b0ca94
+│   │   │   └── fc3d955cdd99d822d3a63119f463d5c7063050
+│   │   ├── 65
+│   │   │   └── 4a5babcbbadac65c5808ebb3f9de5cf835d969
+│   │   ├── 67
+│   │   │   └── 1c87c6c77a77012e1feb9709408b9507844d75
+│   │   ├── 6f
+│   │   │   └── c7f6f363c4ea7b61af896886486830199b3ea7
+│   │   ├── 77
+│   │   │   ├── 4ab4f627a1b6e88748249f09851ddadc850d96
+│   │   │   ├── c94f57c6d47dec199dffddc915249a721e9500
+│   │   │   └── ea51a022ffb94e86bc1886eee1b93c0689461c
+│   │   ├── 79
+│   │   │   └── 02919eb4ff068d917cb3ed8033e179162359a5
+│   │   ├── 7b
+│   │   │   └── 76a3db34f08b0c3c50ce4887cdaf7eaa857bc5
+│   │   ├── 86
+│   │   │   └── 8e005e242cfa5911a35e14aac7aacbaaf8ec51
+│   │   ├── 8c
+│   │   │   └── a656b77a4c6e2b55c4afd6e3624b257d97a145
+│   │   ├── 93
+│   │   │   └── d1c17c18186932f002c11316d88a495cf75e76
+│   │   ├── 95
+│   │   │   └── 2cd5a79019f3637308cc6a9bb0f576910a419f
+│   │   ├── 96
+│   │   │   └── 77604a8180138ad63a94c84c70555122711382
+│   │   ├── 97
+│   │   │   └── bf84a98a756b500d36d79a5fa1d86821d07a82
+│   │   ├── 9b
+│   │   │   └── 047a9b047dd7721684f4bb473b91f4434fbce1
+│   │   ├── 9e
+│   │   │   └── ade9a982138b539a74119c7489e7b39fbfe23e
+│   │   ├── a1
+│   │   │   └── 2968d6223b0b2b23d70ff6db0027483f0e5984
+│   │   ├── ab
+│   │   │   └── 603c5289475ad852fbab8105c2b60ad6b9b8c2
+│   │   ├── ad
+│   │   │   └── 4a112d718c45bd1aa9c3cab0114e053c2be5c2
+│   │   ├── b4
+│   │   │   ├── 5d10646f72576624188d1c472d28ef2ce83c9e
+│   │   │   └── 704d3140283fa55524e1145d3f009b9eca4c9f
+│   │   ├── b6
+│   │   │   └── cb065fba051ccf9b51ad21dcef2eb194cc078a
+│   │   ├── b9
+│   │   │   └── 6fe5b6f17614bda6cbdd30ce2b122d6c43affe
+│   │   ├── bc
+│   │   │   └── 68a398c352978260b71b5fa084f6b48df32a0d
+│   │   ├── bf
+│   │   │   └── 6dc4ed30fc2080b2fad143e62dedc978137b4e
+│   │   ├── c5
+│   │   │   └── fc76538c48ed7a09d8fc5547a4673a6f5996ea
+│   │   ├── c6
+│   │   │   └── e464ce6e05d7936a1505d043a91fb9f75e637b
+│   │   ├── c9
+│   │   │   └── 1929517be67546660c16dde54b88effb3d2923
+│   │   ├── d4
+│   │   │   └── 438bc75b21839bec884ba6c4d5af1e0a86549e
+│   │   ├── d6
+│   │   │   └── 232e9a4bc203f25390d94c0cd5e81d0f9c9f3a
+│   │   ├── da
+│   │   │   └── f6c0dbd580338c2c4db6e2a70889b07750f91c
+│   │   ├── de
+│   │   │   ├── 0b941fc2d281e71052a6b64e2e930e1a99bc9a
+│   │   │   ├── 13db94b22d6d93194bc6e21271329c03f125ba
+│   │   │   └── 3154ec1da37ca5c6d965c785255abb50134faf
+│   │   ├── e1
+│   │   │   └── 03ee59911722085521e2c48ad8414314aff302
+│   │   ├── e7
+│   │   │   └── da6319064009e99330ebd11b644c4f52c2a512
+│   │   ├── ed
+│   │   │   └── e6fb4343e1cf817f38a9fccadc60a9b9fa7ed8
+│   │   ├── f6
+│   │   │   └── 6a0312a616bf76382744d0ce95d8250b258633
+│   │   ├── f7
+│   │   │   └── fb47cab23c5786b657970d0e25f424c085c04b
+│   │   ├── fa
+│   │   │   └── df92f2ff870fd911424bc937ac2ba720bc2aa1
+│   │   ├── ff
+│   │   │   ├── 30b15e6ef625d72778df3d3ed58f33ce57ee21
+│   │   │   └── bc834220f280dff7316659d2c8c81740559499
+│   │   ├── info
+│   │   └── pack
+│   │       ├── pack-8645d074552476951e1998272f9bf2a3efb95e60.idx
+│   │       ├── pack-8645d074552476951e1998272f9bf2a3efb95e60.pack
+│   │       └── pack-8645d074552476951e1998272f9bf2a3efb95e60.rev
+│   ├── packed-refs
+│   └── refs
+│       ├── heads
+│       │   └── main
+│       ├── remotes
+│       │   └── origin
+│       └── tags
+├── inference.py
+├── inference_rl.py
+├── karla
+│   ├── data
+│   │   ├── dataset.py
+│   │   ├── __init__.py
+│   │   └── __pycache__
+│   │       ├── dataset.cpython-311.pyc
+│   │       └── __init__.cpython-311.pyc
+│   ├── __init__.py
+│   ├── models
+│   │   ├── __init__.py
+│   │   ├── karla.py
+│   │   ├── l0_perception.py
+│   │   ├── l1_engram.py
+│   │   ├── l2_ctm.py
+│   │   └── __pycache__
+│   │       ├── __init__.cpython-311.pyc
+│   │       ├── karla.cpython-311.pyc
+│   │       ├── l0_perception.cpython-311.pyc
+│   │       ├── l1_engram.cpython-311.pyc
+│   │       └── l2_ctm.cpython-311.pyc
+│   ├── __pycache__
+│   │   └── __init__.cpython-311.pyc
+│   ├── README.md
+│   ├── requirements.txt
+│   ├── scripts
+│   │   ├── __init__.py
+│   │   └── prepare_data.py
+│   ├── training
+│   │   ├── __init__.py
+│   │   ├── __pycache__
+│   │   │   ├── __init__.cpython-311.pyc
+│   │   │   └── trainer.cpython-311.pyc
+│   │   └── trainer.py
+│   └── utils
+│       ├── config.py
+│       ├── __init__.py
+│       └── __pycache__
+│           ├── config.cpython-311.pyc
+│           └── __init__.cpython-311.pyc
+├── LICENSE
+├── train_karla.py
+└── train_rl.py
+
+85 directories, 130 files
