@@ -162,7 +162,7 @@ class SyncComputer(nn.Module):
         beta = gamma * beta + 1.0
         sync = alpha / torch.sqrt(beta.clamp(min=1e-8))
         return sync, alpha, beta
-#comment lol
+#comment
 
 class CTMHead(nn.Module):
     """
