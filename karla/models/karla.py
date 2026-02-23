@@ -251,30 +251,58 @@ class Karla(nn.Module):
         )
     
 
-    def update_memory(self, input_ids: torch.Tensor):
+    def update_memory(self, input_ids: torch.Tensor, base_lr: float = 0.05):
         """
-        Continual Learning Step.
-        Das Modell brennt den neuen Satz in sein L1-Modul ein (Next-Token Prediction).
+        Continual Learning Step (Nested Learning: Surprise-Based Plasticity)
+        Das Modell ändert seine L1-Gewichte NUR, wenn es von der Information überrascht ist.
+        Verhindert Catastrophic Forgetting!
         """
         self.l1.train()
         self.l1_optimizer.zero_grad()
         
-        # Labels sind identisch mit den Input-IDs (Shift passiert intern in forward)
         labels = input_ids.clone()
-        
-        # Wir machen einen normalen Forward-Pass. 
-        # Da wir labels übergeben, berechnet Karla automatisch den CrossEntropy Loss!
         outputs = self.forward(input_ids, labels=labels)
         loss = outputs.loss
         
-        # Live-Update der L1 Gewichte!
+        # ------------------------------------------------------------------
+        # THE NESTED LEARNING MAGIC: Surprise-Based Plasticity
+        # ------------------------------------------------------------------
+        # Ein Loss von 0.0 bedeutet: "Ich weiß das schon perfekt."
+        # Ein Loss > 3.0 bedeutet: "Das ist komplett neu für mich!"
+        
+        loss_val = loss.item()
+        
+        # Wir berechnen den "Surprise Factor" (zwischen 0.0 und 1.0)
+        # Wenn der Loss unter 0.3 fällt, wird die Lernrate praktisch 0.
+        surprise_factor = min(max((loss_val - 0.3) / 4.0, 0.0), 1.0)
+        
+        # Die Lernrate skaliert dynamisch mit der Überraschung!
+        dynamic_lr = base_lr * surprise_factor
+        
+        # Wenn wir gar nicht überrascht sind, sparen wir uns den Backward-Pass (schützt altes Wissen!)
+        if surprise_factor <= 0.01:
+            self.l1.eval()
+            return loss_val
+            
+        # Wende die dynamische Lernrate lokal auf diesen einen Denk-Zyklus an
+        for param_group in self.l1_optimizer.param_groups:
+            # Scale darf sich immer etwas schneller anpassen als die Gewichte
+            if len(param_group['params']) == 1: # Das ist der l1_scale_raw
+                param_group['lr'] = dynamic_lr * 5.0 
+            else:
+                param_group['lr'] = dynamic_lr
+
+        # Update durchführen
         loss.backward()
+        
+        # Gradient Clipping nur für diesen Step, um Momentum-Explosionen zu verhindern
+        torch.nn.utils.clip_grad_norm_(self.l1.parameters(), 1.0)
+        
         self.l1_optimizer.step()
         
         self.l1.eval() 
-        return loss.item()
+        return loss_val
     
-
 
     def count_parameters(self) -> dict:
         counts = {

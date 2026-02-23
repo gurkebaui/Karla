@@ -73,7 +73,7 @@ def generate_text(model, tokenizer, prompt, max_new_tokens=50, temperature=0.7, 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--checkpoint", type=str, required=True, help="Pfad zur .pt Datei")
-    parser.add_argument("--prompt", type=str, default="what is your name?", help="Question")
+    parser.add_argument("--prompt", type=str, default="give code for a simple calculator. please use a tool, to be able to code in python. to use the tool write: <tool>. and if you are done with the python code write:</tool>. a script then detects this tool call of yours and adds the code into my IDE for testing.", help="Task")
     parser.add_argument("--max-tokens", type=int, default=10000)
     parser.add_argument("--temp", type=float, default=0.7)
     args = parser.parse_args()

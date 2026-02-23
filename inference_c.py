@@ -1,36 +1,65 @@
 #!/usr/bin/env python3
-"""
-inference_continual.py - Der Live-Lernende Agent
-================================================
-Demonstriert Continual Learning:
-Das Modell liest einen Fakt, verändert seine L1-Gewichte und erinnert sich daran.
-"""
-
-import argparse
 import torch
 import torch.nn.functional as F
 from transformers import AutoTokenizer
+import os
+import sys
 
+# Pfade setup
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from karla.models.karla import create_karla
 from karla.utils.config import KarlaConfig
 
-def generate_text(model, tokenizer, prompt, max_new_tokens=50, temperature=0.7, top_p=0.9, device="cuda"):
-    model.eval()
-    input_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
-    
-    print(prompt, end="", flush=True)
-    
-    with torch.no_grad():
-        for _ in range(max_new_tokens):
-            seq_len = input_ids.size(1)
-            if seq_len > 512:
-                input_ids = input_ids[:, -512:]
-                
-            with torch.autocast(device_type='cuda', dtype=torch.float16):
-                outputs = model(input_ids)
-                
-            next_token_logits = outputs.logits[0, -1, :] / temperature
+class KarlaAgent:
+    def __init__(self, checkpoint_path):
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"[Agent] Lade auf {self.device}...")
+        
+        self.tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-1.5B", trust_remote_code=True)
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
             
+        config = KarlaConfig()
+        self.model = create_karla(config).to(self.device)
+        
+        if os.path.exists(checkpoint_path):
+            print(f"[Agent] Lade Checkpoint {checkpoint_path}...")
+            ckpt = torch.load(checkpoint_path, map_location=self.device, weights_only=True)
+            # strict=False ist wichtig, falls L1 neu ist
+            missing, unexpected = self.model.load_state_dict(ckpt["model_state_dict"], strict=False)
+            if missing:
+                print(f"[Agent] Warnung: Keys nicht gefunden (neue Module?): {len(missing)}")
+        else:
+            print("[Agent] Starte ohne Checkpoint (Frisch).")
+            
+        # WICHTIG: Modell in Eval-Modus setzen (Dropout deaktivieren)
+        self.model.eval()
+        print("[Agent] Bereit.")
+
+    @torch.no_grad()
+    def generate(self, prompt, max_new_tokens=100, temperature=0.7, top_p=0.9):
+        """
+        Generierungsfunktion - EXAKT wie in deinem funktionierenden inference_v4.py
+        """
+        self.model.eval() # Safety Check
+        
+        input_ids = self.tokenizer.encode(prompt, return_tensors="pt").to(self.device)
+        
+        # Optional: Context kürzen
+        if input_ids.size(1) > 512:
+            input_ids = input_ids[:, -512:]
+
+        for _ in range(max_new_tokens):
+            # 1. Autocast ist PFLICHT für 4-bit Modelle!
+            with torch.autocast(device_type='cuda', dtype=torch.float16):
+                outputs = self.model(input_ids)
+                
+            next_token_logits = outputs.logits[0, -1, :]
+            
+            # Temperature
+            next_token_logits = next_token_logits / temperature
+            
+            # Top-P Sampling (Logik aus inference_v4.py)
             sorted_logits, sorted_indices = torch.sort(next_token_logits, descending=True)
             cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
             
@@ -44,70 +73,94 @@ def generate_text(model, tokenizer, prompt, max_new_tokens=50, temperature=0.7, 
             probs = F.softmax(next_token_logits, dim=-1)
             next_token = torch.multinomial(probs, num_samples=1)
             
-            token_str = tokenizer.decode(next_token[0], skip_special_tokens=True)
-            print(token_str, end="", flush=True)
-            
-            input_ids = torch.cat([input_ids, next_token.unsqueeze(0)], dim=1)
-            
-            if next_token.item() == tokenizer.eos_token_id:
+            # Stop Condition
+            if next_token.item() == self.tokenizer.eos_token_id:
                 break
-    print("\n")
+                
+            input_ids = torch.cat([input_ids, next_token.unsqueeze(0)], dim=1)
 
-def learn_live(model, tokenizer, text, max_steps=60, target_loss=0.5, device="cuda"):
-    """
-    Intelligentes Continual Learning:
-    Das Modell lernt nur so lange, bis der Fakt sitzt (target_loss).
-    Das verhindert Overfitting und "Stottern".
-    """
-    print(f"\n[Lernvorgang startet] Brenne Wissen ein...")
-    
-    # Füge einen unsichtbaren Punkt hinzu, damit das Modell weiß: Hier ist der Satz zu Ende!
-    # Das verhindert das Stottern (Repeating).
-    text_with_stop = text + "."
-    input_ids = tokenizer.encode(text_with_stop, return_tensors="pt").to(device)
-    
-    for step in range(max_steps):
-        loss = model.update_memory(input_ids)
-        print(f"  > Denk-Zyklus {step+1:02d} | Next-Token Loss: {loss:.4f}")
+        # Decode
+        return self.tokenizer.decode(input_ids[0], skip_special_tokens=True)
+
+    def update_memory(self, text):
+        """
+        Lernt einen neuen Fakt. 
+        Korrektur: L0 bleibt IMMER im Eval-Modus (Dropout aus!).
+        """
+        print(f"[Agent] Lerne: {text[:50]}...")
         
-        # Intelligenter Abbruch: Wir hören auf, sobald der Loss unter 0.5 fällt!
-        if loss < target_loss:
-            print(f"  > [Erfolg] Fakt gespeichert bei Step {step+1}! Breche Training ab um Overfitting zu vermeiden.")
-            break
+        # 1. Nur L1 und L2 in Train-Modus setzen (L0 BLEIBT in Eval!)
+        # Das verhindert, dass Dropout im Frozen Backbone Daten zerstört.
+        self.model.l1.train() 
+        self.model.l2.train()
+        
+        # L0 sicherheitshalber in eval lassen
+        self.model.l0.eval()
+        
+        # 2. Optimizer prep
+        self.model.l1_optimizer.zero_grad()
+        
+        input_ids = self.tokenizer.encode(text + ".", return_tensors="pt").to(self.device)
+        labels = input_ids.clone()
+        
+        # 3. Forward mit Autocast
+        with torch.autocast(device_type='cuda', dtype=torch.float16):
+            outputs = self.model(input_ids, labels=labels)
+            loss = outputs.loss
             
-    print("[Lernvorgang abgeschlossen]\n")
+        if loss is None or torch.isnan(loss):
+            print("[Agent] Fehler: Kein Loss berechnet.")
+            return 0.0
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--checkpoint", type=str, required=True)
-    args = parser.parse_args()
+        # 4. Nested Learning Gatekeeper
+        loss_val = loss.item()
+        
+        # NICHT lernen, wenn Loss zu niedrig (Wissen vorhanden)
+        if loss_val < 0.6:
+            print(f"[Agent] Wissen bereits vorhanden (Loss: {loss_val:.2f}). Skip Update.")
+            # Alles zurück auf Eval
+            self.model.eval()
+            return loss_val
+            
+        # NICHT lernen, wenn Loss zu hoch (Datensalat)
+        if loss_val > 6.0:
+            print(f"[Agent] Loss zu hoch (Garbage? {loss_val:.2f}). Skip Update.")
+            self.model.eval()
+            return loss_val
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-1.5B", trust_remote_code=True)
-    
-    config = KarlaConfig()
-    model = create_karla(config).to(device)
-    
-    checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=True)
-    model.load_state_dict(checkpoint["model_state_dict"], strict=False)
-    
-    # 1. Baseline Test (Was weiß das Modell normalerweise?)
-    #print("==================================================")
-    print("TEST 1: VOR DEM LERNEN")
-    #print("==================================================")
-    test_prompt = "Question: What is the secret code to access the main server?\nAnswer:"
-    generate_text(model, tokenizer, test_prompt, max_new_tokens=20)
-    
-    # 2. Das Modell lernt den Fakt (mit sauberem Punkt am Ende!)
-    new_fact = "The secret code to access the main server is ALPHA-TANGO-77."
-    learn_live(model, tokenizer, new_fact, max_steps=60, target_loss=0.3, device=device)
-    
-    # 3. Test nach dem Lernen
-    #print("==================================================")
-    print("TEST 2: NACH DEM LERNEN (Continual Learning aktiv)")
-    #print("==================================================")
-    # Wir fragen das Modell explizit, damit es den Fakt reproduzieren muss!
-    generate_text(model, tokenizer, test_prompt, max_new_tokens=20)
+        # 5. Backward
+        loss.backward()
+        
+        # Gradient Clipping (Lebenswichtig für Stabilität)
+        torch.nn.utils.clip_grad_norm_(self.model.l1.parameters(), max_norm=1.0)
+        
+        # 6. Optimizer Step
+        self.model.l1_optimizer.step()
+        
+        # 7. Zurück in den sicheren Eval-Modus
+        self.model.eval()
+        
+        print(f"[Agent] Update durchgeführt. Loss: {loss_val:.4f}")
+        return loss_val
 
+# -------------------
+# MAIN TEST
+# -------------------
 if __name__ == "__main__":
-    main()
+    checkpoint = "checkpoints_pretrain/INTERRUPTED_step_15999.pt"
+    agent = KarlaAgent(checkpoint)
+    
+    # TEST 1: Normale Generierung
+    print("\n=== TEST 1: GENERIERUNG ===")
+    prompt = "User: Was ist der geheime Code?\nAssistant:"
+    response = agent.generate(prompt, max_new_tokens=50)
+    print(f"Response: {response}")
+
+    # TEST 2: LEARN
+    print("\n=== TEST 2: LEARNING ===")
+    agent.update_memory("Der geheime Code ist KARLA-42.")
+
+    # TEST 3: CHECK LEARNING
+    print("\n=== TEST 3: VERIFY LEARNING ===")
+    response_after = agent.generate(prompt, max_new_tokens=50)
+    print(f"Response: {response_after}")
