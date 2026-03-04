@@ -21,6 +21,8 @@ Instead of a standard transformer pipeline, Karla acts as a multi-frequency brai
 
 ## Quickstart
 
+1. **Go to [Huggingface and download](https://huggingface.co/GurkeBaui/Karla) the checkpoints into the checkpints_pretrain Folder**
+2. **Install dependencies and run**
 ```bash
 pip install torch transformers datasets pandas accelerate bitsandbytes
 cd Karla
