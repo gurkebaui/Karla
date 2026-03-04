@@ -25,8 +25,16 @@ class KarlaAgent:
         if os.path.exists(checkpoint_path):
             print(f"[Agent] Lade Checkpoint {checkpoint_path}...")
             ckpt = torch.load(checkpoint_path, map_location=self.device, weights_only=True)
-            # strict=False ist wichtig, falls L1 neu ist
-            missing, unexpected = self.model.load_state_dict(ckpt["model_state_dict"], strict=False)
+            # Filter 'model.' prefix if present (compatibility with training wrapper)
+            state_dict = {}
+            for k, v in ckpt["model_state_dict"].items():
+                if k.startswith("model."):
+                    state_dict[k[6:]] = v
+                else:
+                    state_dict[k] = v
+
+            # strict=False ist wichtig, falls L1 neu ist oder L0 gefroren war
+            missing, unexpected = self.model.load_state_dict(state_dict, strict=False)
             if missing:
                 print(f"[Agent] Warnung: Keys nicht gefunden (neue Module?): {len(missing)}")
         else:
@@ -43,7 +51,10 @@ class KarlaAgent:
         """
         self.model.eval() # Safety Check
         
-        input_ids = self.tokenizer.encode(prompt, return_tensors="pt").to(self.device)
+        # Apply Chat Template (IMPORTANT for Qwen/ChatML models)
+        messages = [{"role": "user", "content": prompt}]
+        formatted_prompt = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        input_ids = self.tokenizer.encode(formatted_prompt, return_tensors="pt").to(self.device)
         
         # Optional: Context kürzen
         if input_ids.size(1) > 512:
@@ -79,20 +90,19 @@ class KarlaAgent:
                 
             input_ids = torch.cat([input_ids, next_token.unsqueeze(0)], dim=1)
 
-        # Decode
-        return self.tokenizer.decode(input_ids[0], skip_special_tokens=True)
+        # Decode only the NEW tokens
+        generated_ids = input_ids[0, len(self.tokenizer.encode(formatted_prompt, add_special_tokens=False)):]
+        return self.tokenizer.decode(generated_ids, skip_special_tokens=True)
 
     def update_memory(self, text):
         """
         Lernt einen neuen Fakt. 
         Korrektur: L0 bleibt IMMER im Eval-Modus (Dropout aus!).
         """
-        print(f"[Agent] Lerne: {text[:50]}...")
-        
         # 1. Nur L1 und L2 in Train-Modus setzen (L0 BLEIBT in Eval!)
         # Das verhindert, dass Dropout im Frozen Backbone Daten zerstört.
         self.model.l1.train() 
-        self.model.l2.train()
+        self.model.l2.train() # CTM trainiert auch mit!
         
         # L0 sicherheitshalber in eval lassen
         self.model.l0.eval()
@@ -100,7 +110,7 @@ class KarlaAgent:
         # 2. Optimizer prep
         self.model.l1_optimizer.zero_grad()
         
-        input_ids = self.tokenizer.encode(text + ".", return_tensors="pt").to(self.device)
+        input_ids = self.tokenizer.encode(text, return_tensors="pt").to(self.device)
         labels = input_ids.clone()
         
         # 3. Forward mit Autocast
@@ -112,18 +122,17 @@ class KarlaAgent:
             print("[Agent] Fehler: Kein Loss berechnet.")
             return 0.0
 
-        # 4. Nested Learning Gatekeeper
         loss_val = loss.item()
         
+        # 4. Nested Learning Gatekeeper (Surprise-Based Plasticity)
         # NICHT lernen, wenn Loss zu niedrig (Wissen vorhanden)
-        if loss_val < 0.6:
-            print(f"[Agent] Wissen bereits vorhanden (Loss: {loss_val:.2f}). Skip Update.")
-            # Alles zurück auf Eval
+        if loss_val < 0.3:
+             # Alles zurück auf Eval
             self.model.eval()
             return loss_val
             
         # NICHT lernen, wenn Loss zu hoch (Datensalat)
-        if loss_val > 6.0:
+        if loss_val > 8.0:
             print(f"[Agent] Loss zu hoch (Garbage? {loss_val:.2f}). Skip Update.")
             self.model.eval()
             return loss_val
@@ -140,27 +149,63 @@ class KarlaAgent:
         # 7. Zurück in den sicheren Eval-Modus
         self.model.eval()
         
-        print(f"[Agent] Update durchgeführt. Loss: {loss_val:.4f}")
         return loss_val
 
+def learn_live(agent, text, max_steps=40, target_loss=0.3):
+    print(f"\n[Lernvorgang startet] Brenne Wissen ein...")
+    # Punkt am Ende hilft dem Modell, den Satz abzuschließen
+    text_to_learn = text if text.endswith(".") else text + "."
+    
+    for step in range(max_steps):
+        loss = agent.update_memory(text_to_learn)
+        print(f"  > Denk-Zyklus {step+1:02d}/{max_steps} | Loss: {loss:.4f}")
+        
+        if loss < target_loss:
+            print(f"  > [Erfolg] Fakt gespeichert bei Step {step+1}!")
+            break
+    print("[Lernvorgang abgeschlossen]")
+
+
 # -------------------
-# MAIN TEST
+# MAIN TEST (C++ Edition)
 # -------------------
 if __name__ == "__main__":
-    checkpoint = "checkpoints_pretrain/INTERRUPTED_step_15999.pt"
+    # Nimm den BESTEN SFT Checkpoint (nicht den unterbrochenen RL Checkpoint)
+    checkpoint = "checkpoints_pretrain/step_4383.pt" 
+    # Falls du den RL checkpoint nehmen willst: "checkpoints_pretrain/RL_INTERRUPTED_step_87.pt"
+    
+    if not os.path.exists(checkpoint):
+        print(f"Checkpoint nicht gefunden: {checkpoint}")
+        # Fallback auf den letzten bekannten guten
+        checkpoint = "checkpoints_pretrain/INTERRUPTED_step_20706.pt" 
+
     agent = KarlaAgent(checkpoint)
     
-    # TEST 1: Normale Generierung
-    print("\n=== TEST 1: GENERIERUNG ===")
-    prompt = "User: Was ist der geheime Code?\nAssistant:"
-    response = agent.generate(prompt, max_new_tokens=50)
-    print(f"Response: {response}")
-
-    # TEST 2: LEARN
-    print("\n=== TEST 2: LEARNING ===")
-    agent.update_memory("Der geheime Code ist KARLA-42.")
-
-    # TEST 3: CHECK LEARNING
-    print("\n=== TEST 3: VERIFY LEARNING ===")
-    response_after = agent.generate(prompt, max_new_tokens=50)
-    print(f"Response: {response_after}")
+    # TEST 1: Baseline (Kann sie C++?)
+    print("\n==================================================")
+    print("TEST 1: VOR DEM LERNEN (C++ Task)")
+    print("==================================================")
+    prompt = "Write a C++ function that calculates the factorial of a number. Only code, no explanation."
+    response = agent.generate(prompt, max_new_tokens=150)
+    print(f"Response:\n{response}")
+    
+    # TEST 2: LIVE LERNEN (C++ Syntax Injektion)
+    print("\n==================================================")
+    print("LIVE LERNEN: C++ SYNTAX INJEKTION")
+    print("==================================================")
+    
+    # Ein kleines Stück C++ Wissen
+    cpp_knowledge = """In C++, a function to calculate the square of a number looks like this:
+int square(int x) {
+    return x * x;
+}"""
+    
+    learn_live(agent, cpp_knowledge, max_steps=40, target_loss=0.3)
+    
+    # TEST 3: Resultat (Hat das Wissen geholfen?)
+    print("\n==================================================")
+    print("TEST 2: NACH DEM LERNEN (C++ Task)")
+    print("==================================================")
+    # Wir stellen genau dieselbe Frage nochmal!
+    response_after = agent.generate(prompt, max_new_tokens=150)
+    print(f"Response:\n{response_after}")

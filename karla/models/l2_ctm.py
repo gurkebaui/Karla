@@ -111,7 +111,7 @@ class CTMHead(nn.Module):
         num_action_pairs: int = 512,
         num_output_pairs: int = 512,
         attn_heads: int = 8,
-        l0_hidden_dim: int = 1536,
+        l0_hidden_dim: int = 2048,
         dropout: float = 0.1,
         **kwargs
     ):

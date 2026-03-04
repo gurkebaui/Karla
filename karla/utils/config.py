@@ -14,7 +14,8 @@ import os
 @dataclass
 class L0Config:
     """L0 - Perception Layer (Frozen Qwen)"""
-    model_name: str = "Qwen/Qwen2.5-1.5B"
+    #model_name: str = "Qwen/Qwen2.5-1.5B"
+    model_name: str = "nvidia/Cosmos-Reason2-2B"
     bits: int = 4  # 4-bit quantization
     frozen: bool = True
 

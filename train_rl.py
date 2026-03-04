@@ -1,532 +1,262 @@
 #!/usr/bin/env python3
 """
-train_rl.py — POPE (Privileged On-Policy Exploration) + GRPO for Karla C1.
-
-Fixes:
-- Old log_probs computed under SAME sampling distribution (temperature)
-- PPO/GRPO clipping is SIGN-AWARE (min for A>=0, max for A<0)
-- Avoid leaf requires_grad accumulation anti-pattern
-- Move correct scale params (l1_scale_raw/ctm_scale_raw)
+train_rl.py - Karla Phase 4: Local JSONL Reinforcement Learning
+===============================================================
+Trainiert Karla (CTM + MoE) auf logisches Denken anhand lokaler
+Claude Opus Reasoning-Daten.
 """
 
 import argparse
-import json
 import logging
 import os
-import re
 import sys
-import time
-import random
-from dataclasses import dataclass
-from typing import List, Dict, Tuple
-
+import json
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
+from transformers import AutoTokenizer
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, PROJECT_ROOT)
+sys.path.insert(0, os.path.join(PROJECT_ROOT, "karla"))
 
-from karla.utils.config import KarlaConfig
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(message)s")
+logger = logging.getLogger("GRPO-Opus")
+
 from karla.models.karla import create_karla
+from karla.utils.config import KarlaConfig
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-logger = logging.getLogger("POPE-RL")
-
-
-# ============================================================
-# 1. POPE Data Loader
-# ============================================================
-
-@dataclass
-class POPEProblem:
-    prompt: str
-    reasoning: str
-    answer: str
-    difficulty: str
-    is_guided: bool = False
-    oracle_prefix: str = ""
-
-
-class POPEDataset:
-    def __init__(
-        self,
-        data_path: str,
-        guidance_ratio: float = 0.5,
-        prefix_ratio_min: float = 0.10,
-        prefix_ratio_max: float = 0.30,
-    ):
-        self.guidance_ratio = guidance_ratio
-        self.prefix_ratio_min = prefix_ratio_min
-        self.prefix_ratio_max = prefix_ratio_max
-        self.problems: List[Dict] = []
-        self._load(data_path)
-        logger.info(f"[POPE] Loaded {len(self.problems)} problems from {data_path}")
-
-    def _extract_answer_from_reasoning(self, reasoning: str) -> str:
-        match = re.search(r"<answer>\s*(.*?)\s*</answer>", reasoning, re.DOTALL | re.IGNORECASE)
-        if match:
-            ans = match.group(1).strip()
-            return ans[:300] if len(ans) > 300 else ans
-        return ""
-
-    def _extract_thinking_from_reasoning(self, reasoning: str) -> str:
-        match = re.search(r"<think>\s*(.*?)\s*</think>", reasoning, re.DOTALL | re.IGNORECASE)
-        if match:
-            return match.group(1).strip()
-        parts = reasoning.split("<answer>")
-        if len(parts) > 1:
-            return parts[0].replace("<think>", "").replace("</think>", "").strip()
-        return reasoning
-
-    def _load(self, path):
-        with open(path, "r", encoding="utf-8") as f:
-            answers_found = 0
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    data = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-
-                prompt = data.get("prompt") or data.get("question") or ""
-                reasoning_full = data.get("reasoning") or data.get("cot") or data.get("response") or data.get("solution") or ""
-                answer = data.get("answer") or ""
-                
-                # Extract from <answer> tag if field is empty
-                if not answer and reasoning_full:
-                    answer = self._extract_answer_from_reasoning(reasoning_full)
-                
-                if answer:
-                    answers_found += 1
-
-                thinking = self._extract_thinking_from_reasoning(reasoning_full)
-                difficulty = data.get("difficulty", "hard")
-
-                prompt = prompt.replace("Let's think step by step:", "").strip()
-
-                if prompt and (answer or thinking):
-                    self.problems.append(
-                        {"prompt": prompt, "reasoning": thinking, "answer": answer, "difficulty": difficulty}
-                    )
+# ==============================================================================
+# REWARD SYSTEM (Der universelle Opus-Richter)
+# ==============================================================================
+def calculate_rewards(prompts: list[str], completions: list[str], target_answers: list[str]) -> torch.Tensor:
+    rewards =[]
+    for prompt, comp, target in zip(prompts, completions, target_answers):
+        score = 0.0
+        comp_clean = comp.strip()
+        target_clean = target.strip()
+        
+        # 1. ALIGNMENT PENALTIES (Keine Rollen-Halluzinationen!)
+        if "<|im_start|>" in comp_clean:
+            score -= 5.0  
             
-            logger.info(f"[POPE] Extracted answers: {answers_found}/{len(self.problems)}")
+        # 2. THINKING REWARD (DeepSeek-R1 Style)
+        if "<think>" in comp_clean and "</think>" in comp_clean:
+            score += 2.0  # Volle Punkte für sauberes Denken
+        elif "<think>" in comp_clean:
+            score += 0.5  # Zumindest angefangen zu denken...
+            
+        # 3. ZIEL-ERKENNUNG (Stimmt das Ergebnis mit Opus überein?)
+        # Da Opus seine Final Answer meist ganz am Ende gibt, vergleichen wir 
+        # die letzten ~40 Zeichen (ohne Leerzeichen für höhere Robustheit).
+        target_tail = "".join(target_clean[-40:].split())
+        comp_tail = "".join(comp_clean[-100:].split()) # Wir suchen in den letzten 100 Zeichen von Karla
+        
+        if len(target_tail) > 5 and target_tail in comp_tail:
+            score += 4.0 # Genial! Richtiges Ergebnis gefunden.
+            
+        # 4. LÄNGEN-STRAFE
+        if len(comp_clean) > 2000:
+            score -= 1.0
+            
+        # 5. SAUBERES ENDE
+        if comp.endswith("<|im_end|>"):
+            score += 1.0
+            
+        rewards.append(score)
+        
+    return torch.tensor(rewards, dtype=torch.float32)
 
-    def sample_batch(self, batch_size: int) -> List[POPEProblem]:
-        batch = []
-        selected = random.choices(self.problems, k=batch_size)
+# ==============================================================================
+# LOKALER JSONL STREAMER
+# ==============================================================================
+def stream_local_jsonl(filepath):
+    """Liest die JSONL Zeile für Zeile, braucht fast 0 RAM."""
+    if not os.path.exists(filepath):
+        logger.error(f"Dataset {filepath} nicht gefunden!")
+        sys.exit(1)
+        
+    while True: # Endlosschleife (Epochen) über die Datei
+        with open(filepath, 'r', encoding='utf-8') as f:
+            for line in f:
+                if not line.strip(): continue
+                try:
+                    yield json.loads(line)
+                except Exception:
+                    pass
 
-        for prob in selected:
-            is_hard = prob["difficulty"] == "hard"
-            use_guidance = is_hard and (random.random() < self.guidance_ratio)
-
-            oracle_prefix = ""
-            if use_guidance:
-                oracle_prefix = self._extract_prefix(prob["reasoning"])
-
-            batch.append(
-                POPEProblem(
-                    prompt=prob["prompt"],
-                    reasoning=prob["reasoning"],
-                    answer=prob["answer"],
-                    difficulty=prob["difficulty"],
-                    is_guided=use_guidance,
-                    oracle_prefix=oracle_prefix,
-                )
-            )
-
-        return batch
-
-    def _extract_prefix(self, reasoning: str) -> str:
-        words = reasoning.split()
-        if len(words) < 10:
-            return reasoning
-        ratio = random.uniform(self.prefix_ratio_min, self.prefix_ratio_max)
-        cut = max(5, int(len(words) * ratio))
-        return " ".join(words[:cut])
-
-
-class RewardFunction:
-    @staticmethod
-    def extract_key_concepts(text: str) -> List[str]:
-        stop_words = {
-            "the","and","for","are","but","not","you","all","can","had","her","was","one","our",
-            "out","has","have","been","from","that","this","with","they","will","each","make",
-            "like","into","them","than","then","also","such","when","what","which","their","said",
-            "more","some","very","would","about","could","these","other","given","patient","following",
-        }
-        words = re.findall(r"[a-zA-Z]+", (text or "").lower())
-        concepts = [w for w in words if len(w) > 4 and w not in stop_words]
-
-        phrases = re.findall(
-            r"(?:cerebral|subarachnoid|aneurysm|hemorrhage|vasospasm|nimodipine|hydrocephalus|coiling|clipping|angiography|"
-            r"blood pressure|hypertension|diagnostic|management|treatment|monitoring)",
-            (text or "").lower(),
-        )
-        concepts.extend(phrases)
-        return list(set(concepts))
-
-    @classmethod
-    def score(cls, response: str, ground_truth: str) -> float:
-        if not ground_truth:
-            return 0.0
-        gt = cls.extract_key_concepts(ground_truth)
-        if not gt:
-            return 0.0
-        r = (response or "").lower()
-        hits = sum(1 for c in gt if c in r)
-        coverage = hits / max(len(gt), 1)
-
-        # keep your discrete reward (optional: make continuous later)
-        if coverage >= 0.6:
-            return 1.0
-        elif coverage >= 0.3:
-            return 0.5
-        else:
-            return 0.0
-
-
-# ============================================================
-# 3. Rollout Generation
-# ============================================================
-
-POPE_SYSTEM_INSTRUCTION = (
-    "You are given a problem and a partial solution. Your task is to carefully study "
-    "the partial response, identify what reasoning or steps are already provided, and "
-    "then complete the solution from where it left off. Ensure your response is logically "
-    "consistent and leads to a complete and correct final answer.\n"
-    "Important: Show your reasoning step-by-step, and present the final answer using "
-    "\\boxed{your answer here}."
-)
-
-
-@dataclass
-class Rollout:
-    problem: POPEProblem
-    prompt_ids: torch.Tensor
-    response_ids: torch.Tensor
-    log_probs: torch.Tensor
-    reward: float
-    response_text: str
-
-
-class RolloutGenerator:
-    def __init__(self, model, tokenizer, device, max_new_tokens=256):
+# ==============================================================================
+# GRPO TRAINER
+# ==============================================================================
+class GRPOTrainer:
+    def __init__(self, model, tokenizer, device, args):
         self.model = model
         self.tokenizer = tokenizer
         self.device = device
-        self.max_new_tokens = max_new_tokens
-        self.eos_id = tokenizer.eos_token_id
-
-        self.stop_ids = {self.eos_id}
-        try:
-            im_end = tokenizer.encode("<|im_end|>", add_special_tokens=False)
-            if im_end:
-                self.stop_ids.add(im_end[0])
-        except Exception:
-            pass
-
-    def _format_prompt(self, problem: POPEProblem) -> str:
-        if problem.is_guided and problem.oracle_prefix:
-            messages = [
-                {"role": "system", "content": POPE_SYSTEM_INSTRUCTION},
-                {"role": "user", "content": (
-                    f"Problem: {problem.prompt}\n\n"
-                    f"Partial Response: {problem.oracle_prefix}\n\n"
-                    f"Continue solving the problem, starting from where the partial response ends."
-                )},
-            ]
-        else:
-            messages = [{"role": "user", "content": problem.prompt}]
-
-        if hasattr(self.tokenizer, "apply_chat_template"):
-            return self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-
-        if problem.is_guided:
-            return (
-                f"<|im_start|>system\n{POPE_SYSTEM_INSTRUCTION}<|im_end|>\n"
-                f"<|im_start|>user\nProblem: {problem.prompt}\nPartial Response: {problem.oracle_prefix}<|im_end|>\n"
-                f"<|im_start|>assistant\n"
-            )
-        return f"<|im_start|>user\n{problem.prompt}<|im_end|>\n<|im_start|>assistant\n"
-
+        self.G = args.group_size
+        self.max_prompt_len = 512
+        self.max_gen_len = 256 # Genug Platz für Gedanken und Antwort
+        self.clip_eps = 0.2
+        
+        trainable_params = [p for p in model.parameters() if p.requires_grad]
+        self.optimizer = torch.optim.AdamW(trainable_params, lr=1e-5, weight_decay=0.01)
+        
     @torch.no_grad()
-    def generate_rollouts(self, problems: List[POPEProblem], num_rollouts: int = 4, temperature: float = 0.8):
+    def generate_group(self, prompt_text: str):
         self.model.eval()
-        all_rollouts = []
+        messages =[{"role": "user", "content": prompt_text}]
+        formatted_prompt = self.tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        
+        prompt_ids = self.tokenizer.encode(formatted_prompt, return_tensors="pt").to(self.device)
+        prompt_ids = prompt_ids[:, -self.max_prompt_len:] 
+        prompt_len = prompt_ids.size(1)
+        
+        input_ids = prompt_ids.expand(self.G, -1)
+        
+        for _ in range(self.max_gen_len):
+            with torch.autocast(device_type='cuda', dtype=torch.float16):
+                outputs = self.model(input_ids)
+            next_token_logits = outputs.logits[:, -1, :]
+            
+            # Temperatur = 1.0 (Hohe Kreativität für GRPO-Varianz)
+            probs = F.softmax(next_token_logits / 1.0, dim=-1)
+            next_tokens = torch.multinomial(probs, num_samples=1)
+            
+            input_ids = torch.cat([input_ids, next_tokens], dim=1)
+            
+            if (input_ids[:, -1] == self.tokenizer.eos_token_id).all():
+                break
+                
+        completions_ids = input_ids[:, prompt_len:]
+        completions_text = self.tokenizer.batch_decode(completions_ids, skip_special_tokens=False)
+        
+        return input_ids, completions_text, prompt_len
 
-        for prob in problems:
-            prompt_text = self._format_prompt(prob)
-            prompt_ids = self.tokenizer.encode(prompt_text, return_tensors="pt", add_special_tokens=False).to(self.device)
-            prob_rollouts = []
-
-            for _ in range(num_rollouts):
-                generated = prompt_ids[0].tolist()
-                response_ids = []
-                logps = []
-
-                for _t in range(self.max_new_tokens):
-                    cur = torch.tensor([generated], dtype=torch.long, device=self.device)
-                    mask = torch.ones_like(cur)
-
-                    out = self.model(cur, mask)
-                    logits = out.logits[0, -1, :].float()
-
-                    # Sample from TEMPERATURED distribution
-                    scaled = logits / max(temperature, 1e-8)
-                    probs = F.softmax(scaled, dim=-1)
-                    tok = torch.multinomial(probs, 1).item()
-
-                    # Store old logprob under SAME distribution as behavior policy
-                    logp = torch.log(probs[tok].clamp(min=1e-12)).item()
-
-                    response_ids.append(tok)
-                    logps.append(logp)
-                    generated.append(tok)
-
-                    if tok in self.stop_ids:
-                        break
-
-                response_text = self.tokenizer.decode(response_ids, skip_special_tokens=True)
-                reward = RewardFunction.score(response_text, prob.answer)
-
-                prob_rollouts.append(
-                    Rollout(
-                        problem=prob,
-                        prompt_ids=prompt_ids[0].detach().cpu(),
-                        response_ids=torch.tensor(response_ids, dtype=torch.long),
-                        log_probs=torch.tensor(logps, dtype=torch.float32),
-                        reward=reward,
-                        response_text=response_text,
-                    )
-                )
-
-            all_rollouts.append(prob_rollouts)
-
+    def train_step(self, prompt_text: str, target_answer: str):
+        torch.cuda.empty_cache() 
+        full_ids, completions_text, prompt_len = self.generate_group(prompt_text)
+        
+        prompts_list =[prompt_text] * self.G
+        targets_list = [target_answer] * self.G
+        rewards = calculate_rewards(prompts_list, completions_text, targets_list).to(self.device)
+        
+        mean_reward = rewards.mean()
+        std_reward = rewards.std() + 1e-8
+        advantages = (rewards - mean_reward) / std_reward
+        
+        best_idx = rewards.argmax().item()
+        logger.info(f"\n[PROMPT] {prompt_text[:80].replace(chr(10), ' ')}...")
+        logger.info(f"[BEST ANSWER | Reward: {rewards[best_idx].item():.1f}]:\n{completions_text[best_idx].strip()[:250]}...")
+        
+        self.model.eval()
+        with torch.no_grad():
+            with torch.autocast(device_type='cuda', dtype=torch.float16):
+                old_outputs = self.model(full_ids)
+            old_logits = old_outputs.logits[:, prompt_len-1:-1, :]
+            targets = full_ids[:, prompt_len:]
+            old_log_probs = F.log_softmax(old_logits, dim=-1).gather(2, targets.unsqueeze(-1)).squeeze(-1)
+            
         self.model.train()
-        return all_rollouts
-
-
-# ============================================================
-# 4. GRPO Loss (sign-aware PPO clipping)
-# ============================================================
-
-class GRPOLoss:
-    def __init__(self, clip_low: float = 0.2, clip_high: float = 5.0):
-        # IMPORTANT: clip_low should be >0 to allow ratio < 1 for negative advantages
-        self.clip_low = clip_low
-        self.clip_high = clip_high
-
-    def compute_advantages(self, rewards: List[float]) -> List[float]:
-        if not rewards:
-            return []
-        mean_r = sum(rewards) / len(rewards)
-        var_r = sum((r - mean_r) ** 2 for r in rewards) / max(len(rewards), 1)
-        std_r = max(var_r ** 0.5, 1e-8)
-        return [(r - mean_r) / std_r for r in rewards]
-
-    def compute_loss(self, model, rollouts: List[Rollout], device: torch.device, temperature: float):
-        if not rollouts:
-            return torch.zeros((), device=device), {}
-
-        rewards = [r.reward for r in rollouts]
-        advs = self.compute_advantages(rewards)
-
-        total_loss = torch.zeros((), device=device)
-        used = 0
-
-        stats = {
-            "rewards": rewards,
-            "advantages": advs,
-            "mean_reward": sum(rewards) / len(rewards),
-            "num_correct": sum(1 for r in rewards if r > 0),
-        }
-
-        for rollout, adv in zip(rollouts, advs):
-            if abs(adv) < 1e-8:
-                continue
-
-            full_ids = torch.cat([rollout.prompt_ids.to(device), rollout.response_ids.to(device)]).unsqueeze(0)
-            attention_mask = torch.ones_like(full_ids)
-            prompt_len = rollout.prompt_ids.numel()
-
-            out = model(full_ids, attention_mask)
-            logits = out.logits  # (1, seq, vocab)
-
-            # response token logits (shifted)
-            resp_logits = logits[0, prompt_len - 1 : -1, :].float()
-            resp_tgt = rollout.response_ids.to(device)
-
-            L = min(resp_logits.size(0), resp_tgt.numel())
-            if L <= 0:
-                continue
-            resp_logits = resp_logits[:L]
-            resp_tgt = resp_tgt[:L]
-
-            # CURRENT logprobs under SAME temperature distribution
-            scaled = resp_logits / max(temperature, 1e-8)
-            log_probs_all = F.log_softmax(scaled, dim=-1)
-            cur_logp = log_probs_all.gather(1, resp_tgt.unsqueeze(1)).squeeze(1)
-
-            old_logp = rollout.log_probs[:L].to(device)
-            ratio = torch.exp(cur_logp - old_logp)
-
-            # PPO clip range
-            clipped = torch.clamp(ratio, 1.0 - self.clip_low, 1.0 + self.clip_high)
-
-            adv_t = torch.tensor(adv, device=device, dtype=torch.float32)
-
-            surr1 = ratio * adv_t
-            surr2 = clipped * adv_t
-
-            # SIGN-AWARE:
-            # For adv>=0 => min(surr1, surr2)
-            # For adv<0  => max(surr1, surr2)
-            if adv >= 0:
-                obj = torch.min(surr1, surr2)
-            else:
-                obj = torch.max(surr1, surr2)
-
-            loss = -obj.mean()
-            total_loss = total_loss + loss
-            used += 1
-
-        if used > 0:
-            total_loss = total_loss / used
-
-        return total_loss, stats
-
-
-# ============================================================
-# 5. Main loop
-# ============================================================
-
-def run_pope_rl(args):
-    logger.info("=" * 60)
-    logger.info("KARLA C1 - POPE-GRPO RL")
-    logger.info("=" * 60)
-
-    config = KarlaConfig()
-    device = torch.device(config.training.device)
-
-    from transformers import AutoTokenizer
-    tokenizer = AutoTokenizer.from_pretrained(config.l0.model_name, trust_remote_code=True)
-    if tokenizer.pad_token is None:
-        tokenizer.pad_token = tokenizer.eos_token
-
-    model = create_karla(config)
-
-    # optional load
-    ckpt_path = args.checkpoint
-    if ckpt_path and os.path.exists(ckpt_path):
-        ckpt = torch.load(ckpt_path, map_location="cpu")
-        state = ckpt.get("model_state_dict", ckpt)
-        model.load_state_dict(state, strict=False)
-        logger.info(f"Loaded checkpoint: {ckpt_path}")
-
-    # move non-L0 modules
-    for name, module in model.named_children():
-        if name != "l0":
-            module.to(device)
-
-    model.l1_scale_raw.data = model.l1_scale_raw.data.to(device)
-    model.ctm_scale_raw.data = model.ctm_scale_raw.data.to(device)
-    model.train()
-
-    dataset = POPEDataset(args.data_path or config.training.data_path, guidance_ratio=args.guidance_ratio)
-
-    trainable = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.AdamW(trainable, lr=args.lr, weight_decay=0.01, betas=(0.9, 0.95))
-
-    rollout_gen = RolloutGenerator(model, tokenizer, device, max_new_tokens=args.max_response_tokens)
-    grpo = GRPOLoss(clip_low=args.clip_low, clip_high=args.clip_high)
-
-    os.makedirs(args.output_dir, exist_ok=True)
-    best_reward = -1e9
-
-    for step in range(args.num_steps):
-        t0 = time.time()
-
-        problems = dataset.sample_batch(args.problems_per_step)
-        all_rollouts = rollout_gen.generate_rollouts(
-            problems, num_rollouts=args.rollouts_per_problem, temperature=args.temperature
-        )
-
-        optimizer.zero_grad()
-
-        total_loss = torch.zeros((), device=device)
-        total_reward = 0.0
-        total_correct = 0
-        total_rollouts = 0
-        groups_with_signal = 0
-
-        for group in all_rollouts:
-            loss, stats = grpo.compute_loss(model, group, device, temperature=args.temperature)
-            if loss.item() != 0.0:
-                total_loss = total_loss + loss
-                groups_with_signal += 1
-
-            total_reward += stats.get("mean_reward", 0.0)
-            total_correct += stats.get("num_correct", 0)
-            total_rollouts += len(group)
-
-        if groups_with_signal > 0:
-            avg_loss = total_loss / groups_with_signal
-            avg_loss.backward()
-            nn.utils.clip_grad_norm_(trainable, 1.0)
-            optimizer.step()
-
-        model.update_memory()
-
-        avg_reward = total_reward / max(len(all_rollouts), 1)
-        elapsed = time.time() - t0
-
-        if step % args.log_interval == 0:
-            logger.info(
-                f"Step {step:4d} | loss {total_loss.item():.4f} | reward {avg_reward:.3f} | "
-                f"correct {total_correct}/{total_rollouts} | "
-                f"l1_scale {model.l1_scale().item():.4f} | ctm_scale {model.ctm_scale().item():.4f} | "
-                f"time {elapsed:.1f}s"
-            )
-
-        if avg_reward > best_reward and total_correct > 0:
-            best_reward = avg_reward
-            path = os.path.join(args.output_dir, "best_rl_model.pt")
-            torch.save({"model_state_dict": model.state_dict(), "step": step, "reward": avg_reward}, path)
-            logger.info(f"New best saved: {path} (reward={avg_reward:.3f})")
-
-        if step > 0 and step % args.save_interval == 0:
-            path = os.path.join(args.output_dir, f"rl_step_{step}.pt")
-            torch.save(model.state_dict(), path)
-
-    logger.info(f"Done. Best reward={best_reward:.3f}")
-
+        ppo_epochs = 3 
+        total_loss = 0.0
+        
+        for _ in range(ppo_epochs):
+            self.optimizer.zero_grad()
+            with torch.autocast(device_type='cuda', dtype=torch.float16):
+                outputs = self.model(full_ids)
+                
+            logits = outputs.logits[:, prompt_len-1:-1, :]
+            log_probs = F.log_softmax(logits, dim=-1).gather(2, targets.unsqueeze(-1)).squeeze(-1)
+            
+            ratio = torch.exp(log_probs - old_log_probs)
+            surr1 = ratio * advantages.unsqueeze(1)
+            surr2 = torch.clamp(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps) * advantages.unsqueeze(1)
+            loss = -torch.min(surr1, surr2).mean()
+            
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+            self.optimizer.step()
+            total_loss += loss.item()
+            
+        approx_kl = (old_log_probs - log_probs.detach()).mean().item()
+        return total_loss / ppo_epochs, mean_reward.item(), approx_kl
 
 def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--data-path", type=str, default="data/micro_pope_data.jsonl")
-    p.add_argument("--checkpoint", type=str, default=None)
-    p.add_argument("--output-dir", type=str, default="checkpoints_rl")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--checkpoint", type=str, required=True)
+    parser.add_argument("--dataset", type=str, required=True, help="Pfad zur Opus JSONL Datei")
+    parser.add_argument("--group-size", type=int, default=4)
+    args = parser.parse_args()
 
-    p.add_argument("--guidance-ratio", type=float, default=0.5)
-
-    p.add_argument("--clip-low", type=float, default=0.2)
-    p.add_argument("--clip-high", type=float, default=5.0)
-    p.add_argument("--lr", type=float, default=1e-6)
-
-    p.add_argument("--num-steps", type=int, default=500)
-    p.add_argument("--problems-per-step", type=int, default=4)
-    p.add_argument("--rollouts-per-problem", type=int, default=4)
-    p.add_argument("--max-response-tokens", type=int, default=256)
-    p.add_argument("--temperature", type=float, default=0.8)
-
-    p.add_argument("--log-interval", type=int, default=1)
-    p.add_argument("--save-interval", type=int, default=50)
-
-    args = p.parse_args()
-    run_pope_rl(args)
-
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    tokenizer = AutoTokenizer.from_pretrained("nvidia/Cosmos-Reason2-2B", trust_remote_code=True)
+    
+    config = KarlaConfig()
+    config.l0.model_name = "nvidia/Cosmos-Reason2-2B"
+    config.l2.hidden_dim = 512 # BUGFIX: Muss 512 bleiben (SFT Checkpoint State)
+    
+    model = create_karla(config).to(device)
+    
+    logger.info(f"Lade Checkpoint: {args.checkpoint}")
+    checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=True)
+    
+    # Intelligentes Filtern: Wir wollen NUR unsere trainierten CTM/L1 Gewichte
+    state_dict = {}
+    for k, v in checkpoint["model_state_dict"].items():
+        # Entferne Wrapper-Präfix
+        key = k[6:] if k.startswith("model.") else k
+        
+        # Ignoriere ALLES, was zum gefrorenen Backbone (l0) gehört
+        # Egal ob l0.model.model.visual oder l0.model.embed_tokens
+        if key.startswith("l0."):
+            continue
+            
+        state_dict[key] = v
+    
+    # Jetzt laden wir nur die relevanten Teile!
+    # Wir nutzen strict=False, weil das Modell (l0) natürlich mehr Parameter hat 
+    # als wir hier laden (wir laden ja nur l1 und l2).
+    # Aber wir prüfen manuell, ob L1 und L2 geladen wurden.
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    
+    # Sicherheits-Check: Haben wir L1 und L2 geladen?
+    l2_loaded = any("l2.synapse" in k for k in state_dict.keys())
+    if not l2_loaded:
+        logger.warning("WARNUNG: CTM (L2) Gewichte scheinen nicht im Checkpoint zu sein!")
+    else:
+        logger.info("CTM und L1 Gewichte erfolgreich extrahiert und geladen.")
+    # Checkpoint Strict=True um Fehler wie vorhin absolut auszuschließen!
+    #model.load_state_dict(state_dict, strict=True) 
+    
+    trainer = GRPOTrainer(model, tokenizer, device, args)
+    
+    logger.info(f"Verbinde mit lokalem Dataset: {args.dataset}")
+    data_stream = stream_local_jsonl(args.dataset)
+    
+    logger.info("=== STARTE OPUS RL TRAINING ===")
+    
+    for step, item in enumerate(data_stream):
+        try:
+            # Extrahiere User Prompt und Assistant (Target) Antwort
+            user_msg = next((m["content"] for m in item["messages"] if m["role"] == "user"), None)
+            target_msg = next((m["content"] for m in item["messages"] if m["role"] == "assistant"), None)
+            
+            if not user_msg or not target_msg:
+                continue
+                
+            loss, mean_reward, kl = trainer.train_step(user_msg, target_msg)
+            logger.info(f"->[RL Step {step}] Reward: {mean_reward:5.2f} | Loss: {loss:6.4f} | KL: {kl:6.4f} | CTM: {model.ctm_scale().item():.3f}\n")
+            
+            if step > 0 and step % 20 == 0:
+                save_path = f"checkpoints_pretrain/rl_step_{step}.pt"
+                torch.save({"model_state_dict": model.state_dict()}, save_path)
+                
+        except KeyboardInterrupt:
+            print("\nAbbruch! Speichere RL-Checkpoint...")
+            torch.save({"model_state_dict": model.state_dict()}, f"checkpoints_pretrain/RL_INTERRUPTED_step_{step}.pt")
+            break
+        except Exception as e:
+            logger.error(f"Fehler in Step {step}: {e}")
+            continue
 
 if __name__ == "__main__":
     main()
