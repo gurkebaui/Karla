@@ -21,14 +21,14 @@ cd Karla
 python chat.py
 ```
 
-##TODO
+## TODO
 -Train Longer
 -Make L1 Inference Learning Intensity variable
 -Give the Model controll over itself
 -Fix stuttering
 
 
-##Datasets used:
+## Datasets used:
 @misc{Hermes_Reasoning_Tool_Use,
   title  = {Hermes Tool Use Reasoning},
   author = {interstellarninja},
